@@ -15,13 +15,13 @@ class SysExecTool:
         self.log = logging.getLogger("SysExecTool")
         self.is_windows = platform.system() == "Windows"
 
-    def sys_exec(self, cmd: str, timeout: int = 30, cwd: str = None) -> str:
+    def sys_exec(self, cmd: str = None, command: str = None, timeout: int = 30, cwd: str = None) -> str:
         """
         Esegue un comando shell e restituisce l'output.
-        
-        Su Windows usa automaticamente cmd /c se non specificato.
-        Esempio: sys_exec(cmd="mkdir C:\\Users\\test\\Desktop\\mia_cartella")
+        Accetta sia 'cmd' che 'command' come nome parametro.
         """
+        # Accetta sia 'cmd' che 'command' (il modello usa entrambi)
+        cmd = cmd or command
         if not cmd:
             return "❌ Comando vuoto"
 
