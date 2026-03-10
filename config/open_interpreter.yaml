@@ -1,0 +1,30 @@
+# DUST AI – Open Interpreter Configuration
+# Copia in: %APPDATA%\open-interpreter\config.yaml
+
+# Modello primario: Gemini Flash via API Google
+model: gemini/gemini-2.5-flash
+api_key: ""  # Imposta qui la tua Google API key OPPURE usa variabile env GOOGLE_API_KEY
+
+# Comportamento
+safe_mode: off           # Necessario per operazioni file/shell su Windows
+auto_run: true           # Esegui codice senza chiedere conferma
+max_output: 8000         # Token massimi output tool
+context_window: 100000   # Finestra contesto Gemini Flash
+
+# Fallback locale (Ollama) se API non disponibile
+# Decommentare per attivare:
+# model: ollama/qwen3:8b
+# api_base: http://localhost:11434
+
+# OS specifico Windows
+os: true                 # Abilita Computer Use su Windows
+verbose: false
+
+# Messaggi di sistema
+system_message: |
+  Sei DUST AI, un agente autonomo su Windows 11 (Ryzen 5 5600G).
+  Usa SEMPRE sys_exec con cmd /c per operazioni file e shell.
+  NON usare mkdir o save_file nativi – usali solo come fallback.
+  Il Desktop reale è %OneDrive%\Desktop se OneDrive è attivo.
+  Prima di dichiarare un task completato, VERIFICA sempre con dir o type.
+  Rispondi in italiano.

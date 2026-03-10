@@ -1,0 +1,23 @@
+# DUST AI – Dipendenze Python
+# Installa con: pip install -r requirements.txt
+
+# ─── Core AI ──────────────────────────────────────────────────────────────────
+google-generativeai>=0.8.0         # Gemini Flash/Pro API
+requests>=2.31.0                    # HTTP per Perplexity, DuckDuckGo
+
+# ─── Computer Use ─────────────────────────────────────────────────────────────
+pyautogui>=0.9.54                   # Controllo mouse e tastiera
+pillow>=10.0.0                      # Screenshot (richiesto da pyautogui)
+
+# ─── Browser Automation ───────────────────────────────────────────────────────
+playwright>=1.40.0                  # Browser control (dopo install: playwright install chromium)
+
+# ─── Windows API (opzionale, solo Windows) ────────────────────────────────────
+# pywin32>=306                      # Window focus e API Windows (decommentare se su Windows)
+
+# ─── Ollama (fallback locale) ─────────────────────────────────────────────────
+# ollama>=0.2.0                     # Decommentare se usi Ollama locale
+
+# ─── Utilità ──────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0               # Caricamento .env
+colorama>=0.4.6                    # Colori terminale Windows

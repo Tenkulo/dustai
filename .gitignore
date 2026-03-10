@@ -1,0 +1,51 @@
+# Logs e dati sessione
+logs/
+*.log
+*.session
+
+# API Keys – MAI committare
+.env
+secrets.yaml
+api_keys.json
+*_key.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# PyGPT dati utente (non versionare)
+*.db
+*.sqlite
+history/
+context/
+
+# OS
+.DS_Store
+*.swp
+*.tmp
+
+# DUST AI specifico
+venv/
+.venv/
+__pycache__/
+*.pyc
+src/**/__pycache__/
+.env
+*.env
+logs/
+screenshots/
+memory.json
+config.json
