@@ -1,271 +1,278 @@
 """
-DUST AI – GUI v1.2
-PySide6 window completamente connessa all'Agent.
-Classe: DustAIWindow — gestisce autonomamente init agent, threading, output colorato.
+DUST AI – GUI v1.3
+Fix critico: hooked_call() ora accetta **kwargs → risolve
+  "got an unexpected keyword argument 'task_hint'"
+
+Altre fix:
+  - Chat mode usa agent.chat() diretto
+  - Stop button funzionante
+  - Encoding output robusto
 """
 import sys
 import logging
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QTextEdit, QLineEdit, QPushButton, QLabel, QSizePolicy
-)
-from PySide6.QtCore import Qt, QThread, Signal, QObject
-from PySide6.QtGui import QFont, QTextCursor
+try:
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QPushButton, QTextEdit, QLineEdit, QLabel,
+    )
+    from PySide6.QtCore import QThread, Signal
+    from PySide6.QtGui  import QFont, QColor, QTextCursor
+except ImportError:
+    print("pip install PySide6")
+    sys.exit(1)
 
-DARK_STYLE = """
-QWidget { background-color:#1a1a2e; color:#e0e0e0; font-family:'Segoe UI',sans-serif; font-size:13px; }
-QTextEdit { background-color:#16213e; border:1px solid #0f3460; border-radius:6px; padding:8px; color:#e0e0e0; }
-QLineEdit { background-color:#16213e; border:2px solid #0f3460; border-radius:6px; padding:8px 12px; color:#e0e0e0; }
-QLineEdit:focus { border-color:#e94560; }
-QPushButton { background-color:#0f3460; color:#e0e0e0; border:none; border-radius:6px; padding:8px 16px; }
-QPushButton:hover { background-color:#e94560; }
-QPushButton:checked { background-color:#e94560; }
-QPushButton:disabled { background-color:#333; color:#666; }
-QLabel { color:#a0a0b0; }
-"""
+log = logging.getLogger("GUI")
 
-COLORS = {
-    "user":   "#e94560",
-    "think":  "#7a8fcc",
-    "tool":   "#e8a838",
-    "result": "#5a8a5a",
-    "agent":  "#50fa7b",
-    "error":  "#ff5555",
-    "system": "#666688",
+COLOR_MAP = {
+    "user":   "#FF6B6B",
+    "think":  "#4FC3F7",
+    "tool":   "#FFB74D",
+    "result": "#81C784",
+    "agent":  "#81C784",
+    "error":  "#EF5350",
+    "system": "#B0BEC5",
 }
 
 
-class AgentWorker(QObject):
-    chunk    = Signal(str, str)
-    done     = Signal()
+class AgentWorker(QThread):
+    output_signal   = Signal(str, str)
+    finished_signal = Signal()
 
-    def __init__(self, agent, task, mode):
+    def __init__(self, agent, task: str, mode: str = "agent"):
         super().__init__()
-        self.agent = agent
-        self.task  = task
-        self.mode  = mode
+        self.agent      = agent
+        self.task       = task
+        self.mode       = mode
+        self._stop_flag = False
+        self._orig_call = None
+        self._orig_exec = None
 
     def run(self):
-        import json
         try:
-            self.chunk.emit(f"{'🎯' if self.mode == 'agent' else '💬'} {self.task}", "user")
-
-            original_execute = self.agent.tools.execute
-            original_call    = self.agent._call_model
-
-            def hooked_execute(name, params):
-                self.chunk.emit(f"🔧 [{name}]  {json.dumps(params, ensure_ascii=False)[:200]}", "tool")
-                result = original_execute(name, params)
-                self.chunk.emit(f"   ↳ {str(result)[:500]}", "result")
-                return result
-
-            def hooked_call(messages):
-                self.chunk.emit("🧠 Ragionamento...", "think")
-                response = original_call(messages)
-                try:
-                    data = json.loads(response.strip().strip("```json").strip("```"))
-                    if "tool" not in data and len(response.strip()) > 10:
-                        self.chunk.emit(f"💭 {response[:600]}", "think")
-                except Exception:
-                    if len(response.strip()) > 10:
-                        self.chunk.emit(f"💭 {response[:600]}", "think")
-                return response
-
-            self.agent.tools.execute = hooked_execute
-            self.agent._call_model   = hooked_call
-
             if self.mode == "chat":
+                self.output_signal.emit("💬 " + self.task, "user")
                 result = self.agent.chat(self.task)
+                self.output_signal.emit(result, "agent")
             else:
+                self.output_signal.emit("🎯 " + self.task, "user")
+                self._hook()
                 result = self.agent.run_task(self.task)
-
-            self.agent.tools.execute = original_execute
-            self.agent._call_model   = original_call
-            self.chunk.emit(result, "agent")
-
+                self._unhook()
+                self.output_signal.emit("\n✅ " + result, "agent")
         except Exception as e:
-            self.chunk.emit(f"❌ {e}", "error")
+            self._unhook()
+            self.output_signal.emit("❌ " + str(e), "error")
         finally:
-            self.done.emit()
+            self.finished_signal.emit()
+
+    def stop(self):
+        self._stop_flag = True
+
+    def _hook(self):
+        worker = self
+
+        # ── FIX: **kwargs cattura task_hint e qualsiasi argomento futuro ──
+        orig_call = self.agent._call_model
+        self._orig_call = orig_call
+
+        def hooked_call(messages, **kwargs):
+            if worker._stop_flag:
+                raise RuntimeError("Fermato dall'utente")
+            return orig_call(messages, **kwargs)
+
+        self.agent._call_model = hooked_call
+
+        orig_exec = self.agent.tools.execute
+        self._orig_exec = orig_exec
+
+        def hooked_exec(tool_name, params):
+            if worker._stop_flag:
+                raise RuntimeError("Fermato dall'utente")
+            import json
+            worker.output_signal.emit(
+                "🔧 [" + tool_name + "] " + json.dumps(params, ensure_ascii=False)[:160],
+                "tool"
+            )
+            result = orig_exec(tool_name, params)
+            worker.output_signal.emit("   → " + str(result)[:300], "result")
+            return result
+
+        self.agent.tools.execute = hooked_exec
+
+    def _unhook(self):
+        if self._orig_call:
+            self.agent._call_model = self._orig_call
+            self._orig_call = None
+        if self._orig_exec:
+            self.agent.tools.execute = self._orig_exec
+            self._orig_exec = None
 
 
-class DustAIWindow(QWidget):
+class DustAIWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🤖 DUST AI — Desktop Agent")
-        self.setGeometry(100, 100, 980, 680)
-        self.setMinimumSize(700, 480)
-        self._agent  = None
-        self._config = None
-        self._mode   = "agent"
-        self._show_thinking = True
-        self._thread = None
-        self._worker = None
+        self.setWindowTitle("DUST AI v2.0")
+        self.resize(1000, 680)
+        self._worker   = None
+        self._agent    = None
+        self._config   = None
+        self._mode     = "agent"
+        self._thinking = True
         self._build_ui()
-        self.setStyleSheet(DARK_STYLE)
         self._init_agent()
 
-    # ── Build UI ──────────────────────────────────────────────────────────────
-
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(6)
+        central = QWidget()
+        self.setCentralWidget(central)
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
 
-        # Top bar
-        top = QHBoxLayout()
-        self._dot = QLabel("●")
-        self._dot.setFixedWidth(18)
-        self._dot.setStyleSheet("color:#ff5555; font-size:16px;")
-        top.addWidget(self._dot)
-        self._status = QLabel("Inizializzazione...")
-        top.addWidget(self._status)
-        top.addStretch()
+        self.status_label = QLabel("⚙️ Caricamento DUST AI...")
+        self.status_label.setStyleSheet("color:#B0BEC5;font-size:12px;")
+        lay.addWidget(self.status_label)
 
-        self._mode_btn = QPushButton("🤖 Agent")
-        self._mode_btn.setCheckable(True)
-        self._mode_btn.setChecked(True)
-        self._mode_btn.setFixedWidth(120)
-        self._mode_btn.clicked.connect(self._toggle_mode)
-        top.addWidget(self._mode_btn)
+        self.output = QTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setFont(QFont("Consolas", 10))
+        self.output.setStyleSheet(
+            "QTextEdit{background:#1E1E1E;color:#E0E0E0;"
+            "border:1px solid #333;border-radius:4px;}"
+        )
+        lay.addWidget(self.output, stretch=1)
 
-        self._think_btn = QPushButton("🧠 ON")
-        self._think_btn.setCheckable(True)
-        self._think_btn.setChecked(True)
-        self._think_btn.setFixedWidth(80)
-        self._think_btn.clicked.connect(self._toggle_thinking)
-        top.addWidget(self._think_btn)
-
-        self._clear_btn = QPushButton("🗑")
-        self._clear_btn.setFixedWidth(45)
-        self._clear_btn.clicked.connect(lambda: self._output.clear())
-        top.addWidget(self._clear_btn)
-
-        layout.addLayout(top)
-
-        # Output
-        self._output = QTextEdit()
-        self._output.setReadOnly(True)
-        self._output.setFont(QFont("Consolas", 12))
-        layout.addWidget(self._output, stretch=1)
-
-        # Input row
         row = QHBoxLayout()
-        self._input = QLineEdit()
-        self._input.setPlaceholderText("Scrivi un task o un messaggio... (Enter per inviare)")
-        self._input.returnPressed.connect(self._send)
-        self._input.setEnabled(False)
-        row.addWidget(self._input, stretch=1)
+        self.input_field = QLineEdit()
+        self.input_field.setPlaceholderText("Scrivi un task o domanda...")
+        self.input_field.setFont(QFont("Consolas", 10))
+        self.input_field.setStyleSheet(
+            "QLineEdit{background:#2D2D2D;color:#E0E0E0;"
+            "border:1px solid #444;border-radius:4px;padding:6px;}"
+        )
+        self.input_field.returnPressed.connect(self._send)
+        row.addWidget(self.input_field, stretch=1)
 
-        self._send_btn = QPushButton("▶ Invia")
-        self._send_btn.setFixedWidth(100)
-        self._send_btn.setEnabled(False)
-        self._send_btn.clicked.connect(self._send)
-        row.addWidget(self._send_btn)
+        self.send_btn = QPushButton("▶ Invia")
+        self.send_btn.clicked.connect(self._send)
+        self.send_btn.setStyleSheet(self._bs("#1565C0"))
+        row.addWidget(self.send_btn)
 
-        self._stop_btn = QPushButton("⏹")
-        self._stop_btn.setFixedWidth(45)
-        self._stop_btn.setEnabled(False)
-        self._stop_btn.clicked.connect(self._stop)
-        row.addWidget(self._stop_btn)
+        self.stop_btn = QPushButton("⏹ Stop")
+        self.stop_btn.clicked.connect(self._stop)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setStyleSheet(self._bs("#B71C1C"))
+        row.addWidget(self.stop_btn)
 
-        layout.addLayout(row)
+        lay.addLayout(row)
 
-    # ── Agent init ────────────────────────────────────────────────────────────
+        ctrl = QHBoxLayout()
+        self.mode_btn = QPushButton("🤖 Agent")
+        self.mode_btn.clicked.connect(self._toggle_mode)
+        self.mode_btn.setStyleSheet(self._bs("#1B5E20", True))
+        ctrl.addWidget(self.mode_btn)
+
+        self.think_btn = QPushButton("💭 Thinking: ON")
+        self.think_btn.clicked.connect(self._toggle_think)
+        self.think_btn.setStyleSheet(self._bs("#4A148C", True))
+        ctrl.addWidget(self.think_btn)
+
+        cb = QPushButton("🗑 Clear")
+        cb.clicked.connect(self.output.clear)
+        cb.setStyleSheet(self._bs("#37474F", True))
+        ctrl.addWidget(cb)
+        ctrl.addStretch()
+        lay.addLayout(ctrl)
+
+        self.setStyleSheet("QMainWindow,QWidget{background:#121212;}")
+
+    def _bs(self, c, small=False):
+        p = "4px 10px" if small else "6px 16px"
+        return (
+            "QPushButton{background:" + c + ";color:white;border:none;"
+            "border-radius:4px;padding:" + p + ";font-size:11px;}"
+            "QPushButton:hover{background:" + c + "CC;}"
+            "QPushButton:disabled{background:#333;color:#666;}"
+        )
 
     def _init_agent(self):
-        self._log("system", "⚙️  Caricamento DUST AI...")
         try:
             from src.config import Config
-            from src.agent import Agent
+            from src.agent  import Agent
             self._config = Config()
             self._agent  = Agent(self._config)
-            model   = self._config.get_model("primary").split("/")[-1]
-            desktop = str(self._config.get_desktop())
-            self._dot.setStyleSheet("color:#50fa7b; font-size:16px;")
-            self._status.setText(f"Online · {model} · {desktop}")
-            self._log("system", f"✅ Pronto  |  Modello: {model}")
-            self._log("system", f"📁 Desktop: {desktop}")
-            self._input.setEnabled(True)
-            self._send_btn.setEnabled(True)
+            model = self._config.get_model("primary").replace("gemini/", "")
+            self._append("✅ Pronto | Modello: " + model, "system")
+            self._append("📁 Desktop: " + str(self._config.get_desktop()), "system")
+            self.status_label.setText("✅ DUST AI — " + model)
         except Exception as e:
-            self._dot.setStyleSheet("color:#ff5555; font-size:16px;")
-            self._status.setText(f"Errore init: {e}")
-            self._log("error", f"❌ Init fallita: {e}")
-            self._log("system", "💡 Controlla GOOGLE_API_KEY in %APPDATA%\\dustai\\.env")
-
-    # ── Actions ───────────────────────────────────────────────────────────────
+            self._append("❌ Init: " + str(e), "error")
+            self.status_label.setText("❌ Errore")
 
     def _send(self):
-        task = self._input.text().strip()
-        if not task or not self._agent:
+        text = self.input_field.text().strip()
+        if not text or not self._agent:
             return
-        self._input.clear()
-        self._set_busy(True)
-        self._worker = AgentWorker(self._agent, task, self._mode)
-        self._thread = QThread()
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.chunk.connect(self._on_chunk)
-        self._worker.done.connect(self._on_done)
-        self._thread.start()
+        if self._worker and self._worker.isRunning():
+            self._append("⚠️ Task in corso", "error")
+            return
+        self.input_field.clear()
+        self._append("\n" + "─" * 60, "system")
+        self._worker = AgentWorker(self._agent, text, self._mode)
+        self._worker.output_signal.connect(self._on_out)
+        self._worker.finished_signal.connect(self._on_done)
+        self._worker.start()
+        self.send_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.input_field.setEnabled(False)
 
     def _stop(self):
-        if self._thread and self._thread.isRunning():
-            self._thread.requestInterruption()
-            self._thread.quit()
-            self._log("system", "⏹ Interrotto.")
-        self._set_busy(False)
+        if self._worker:
+            self._worker.stop()
+            self._append("⏹ Fermato", "system")
 
-    def _toggle_mode(self):
-        self._mode = "agent" if self._mode_btn.isChecked() else "chat"
-        self._mode_btn.setText("🤖 Agent" if self._mode == "agent" else "💬 Chat")
-
-    def _toggle_thinking(self):
-        self._show_thinking = self._think_btn.isChecked()
-        self._think_btn.setText("🧠 ON" if self._show_thinking else "🧠 OFF")
-
-    # ── Slots ─────────────────────────────────────────────────────────────────
-
-    def _on_chunk(self, text, kind):
-        if kind == "think" and not self._show_thinking:
+    def _on_out(self, text, key):
+        if not self._thinking and key == "think":
             return
-        self._log(kind, text)
+        safe = text.encode("utf-8", errors="replace").decode("utf-8")
+        self._append(safe, key)
 
     def _on_done(self):
-        self._set_busy(False)
-        self._log("system", "─" * 55)
-        if self._thread:
-            self._thread.quit()
-            self._thread.wait()
+        self.send_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.input_field.setEnabled(True)
+        self.input_field.setFocus()
+        self._append("─" * 60, "system")
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _toggle_mode(self):
+        self._mode = "chat" if self._mode == "agent" else "agent"
+        self.mode_btn.setText("💬 Chat" if self._mode == "chat" else "🤖 Agent")
 
-    def _log(self, kind, text):
-        color = COLORS.get(kind, "#e0e0e0")
-        text  = text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\n","<br>")
-        self._output.moveCursor(QTextCursor.End)
-        self._output.insertHtml(f'<span style="color:{color};">{text}</span><br>')
-        self._output.moveCursor(QTextCursor.End)
+    def _toggle_think(self):
+        self._thinking = not self._thinking
+        self.think_btn.setText("💭 Thinking: " + ("ON" if self._thinking else "OFF"))
 
-    def _set_busy(self, busy):
-        self._input.setEnabled(not busy)
-        self._send_btn.setEnabled(not busy)
-        self._stop_btn.setEnabled(busy)
-        self._dot.setStyleSheet(f"color:{'#e8a838' if busy else '#50fa7b'}; font-size:16px;")
-        if not busy and self._config:
-            model = self._config.get_model("primary").split("/")[-1]
-            self._status.setText(f"Online · {model}")
+    def _append(self, text, key="agent"):
+        c = COLOR_MAP.get(key, "#E0E0E0")
+        cur = self.output.textCursor()
+        cur.movePosition(QTextCursor.End)
+        self.output.setTextCursor(cur)
+        self.output.setTextColor(QColor(c))
+        self.output.append(text)
+        self.output.ensureCursorVisible()
+
+
+def launch():
+    app = QApplication.instance() or QApplication(sys.argv)
+    w   = DustAIWindow()
+    w.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    win = DustAIWindow()
-    win.show()
-    sys.exit(app.exec())
+    launch()

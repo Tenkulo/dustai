@@ -362,13 +362,19 @@ class Agent:
                             return {"type": "tool_call", "tool": fc.name, "params": params}
 
                 # Nessuna function call → testo
-                return {"type": "text", "text": response.text.strip()}
+                try:
+                    txt = response.text.strip()
+                except Exception:
+                    txt = ""
+                if not txt:
+                    return {"type": "done", "summary": "task completato"}
+                return {"type": "text", "text": txt}
 
             except Exception as e:
                 err = str(e)
                 if "429" in err or "RESOURCE_EXHAUSTED" in err:
                     wait_match = re.search(r"(\d+)[\s]*s", err)
-                    wait = int(wait_match.group(1)) + 5 if wait_match else 65
+                    wait = min(65, int(wait_match.group(1)) + 5) if wait_match else 65
                     if attempt < max_retries - 1:
                         print("   ⏳ 429 — riprovo in " + str(wait) + "s...")
                         time.sleep(wait)

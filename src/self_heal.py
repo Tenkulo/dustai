@@ -23,6 +23,19 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Any
 
+
+
+def _safe_retry_delay(raw) -> int:
+    """Clamp retry delay tra 5 e 65 secondi. Evita valori in ms o ns."""
+    try:
+        val = float(str(raw).strip())
+        # Se il valore è in millisecondi (>1000) converti in secondi
+        if val > 1000:
+            val = val / 1000
+        return max(5, min(65, int(val)))
+    except Exception:
+        return 30
+
 log = logging.getLogger("SelfHeal")
 
 
