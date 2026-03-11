@@ -212,6 +212,9 @@ class Agent:
         self._last_call_time   = 0.0
         self._heal_engine      = None
 
+
+        # HallucinationGuard v2
+        self._hall_guard = None
         self._setup_gemini()
         self._setup_ollama()
 
@@ -442,6 +445,22 @@ class Agent:
         except Exception as e:
             raise RuntimeError("Ollama call fallita: " + str(e))
 
+
+    def _get_hall_guard(self):
+        """Lazy init HallucinationGuard."""
+        if self._hall_guard is None:
+            try:
+                from .hallucination_guard import HallucinationGuard
+                self._hall_guard = HallucinationGuard(
+                    self.config,
+                    gateway=self._gateway if hasattr(self, "_gateway") else None
+                )
+                self.log.info("HallucinationGuard v2 pronto")
+            except Exception as e:
+                self.log.warning("HallucinationGuard N/D: " + str(e))
+                self._hall_guard = False
+        return self._hall_guard if self._hall_guard else None
+
     def _call_model(self, messages: list, task_hint: str = "") -> dict:
         """
         Chiama il modello migliore disponibile.
@@ -482,6 +501,18 @@ class Agent:
                 # SelfHeal fallito → testo esplicito invece di loop
                 return {"type": "text", "text": "[parse_error] Impossibile estrarre tool call. Raw: " + raw[:200]}
 
+
+                # HallucinationGuard: processa risposta prima di usarla
+                guard = self._get_hall_guard()
+                if guard and isinstance(result, dict) and result.get("type") == "text":
+                    _text = result.get("text", "")
+                    if _text and len(_text) > 30:
+                        _prompt_ctx = messages[-1].get("parts", [""])[0] if messages else ""
+                        _guarded = guard.process(str(_prompt_ctx), _text, level="standard")
+                        if _guarded.get("corrected"):
+                            self.log.info("HallucinationGuard: risposta corretta (conf=%d)", _guarded.get("confidence", 0))
+                            result["text"] = _guarded["text"]
+                            result["_hall_confidence"] = _guarded["confidence"]
             return result
 
         raise RuntimeError("Nessun modello disponibile. Configura GOOGLE_API_KEY o installa Ollama.")
