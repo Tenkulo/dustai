@@ -25,6 +25,16 @@ class ToolRegistry:
     def _register_all(self):
         """Registra tutti i tool disponibili."""
         tool_classes = {
+            
+            # Orchestra AI
+            'ai_ask':     lambda p: (self._get_conductor_tool().ai_ask(**p) if self._get_conductor_tool() else 'N/D'),
+            'ai_parallel':lambda p: (self._get_conductor_tool().ai_parallel(**p) if self._get_conductor_tool() else 'N/D'),
+            'ai_status':  lambda p: (self._get_conductor_tool().ai_status() if self._get_conductor_tool() else 'N/D'),
+            'ai_models':  lambda p: (self._get_conductor_tool().ai_models(**p) if self._get_conductor_tool() else 'N/D'),
+            'git_sync':   lambda p: (self._get_git_sync_tool().git_sync(**p) if self._get_git_sync_tool() else 'N/D'),
+            'git_commit': lambda p: (self._get_git_sync_tool().git_commit(**p) if self._get_git_sync_tool() else 'N/D'),
+            'git_status': lambda p: (self._get_git_sync_tool().git_status() if self._get_git_sync_tool() else 'N/D'),
+            'git_push':   lambda p: (self._get_git_sync_tool().git_push() if self._get_git_sync_tool() else 'N/D'),
             "sys_exec": SysExecTool,
             "file_read": FileOpsTool,
             "file_write": FileOpsTool,
@@ -62,6 +72,27 @@ class ToolRegistry:
                     _instances[cls_name] = None
             self._tools[name] = _instances[cls_name]
 
+
+    # ── Orchestra AI / GitHub tools (v2.0) ──
+    def _get_conductor_tool(self):
+        if not hasattr(self, '_conductor_tool_inst'):
+            try:
+                from ..ai_conductor import AIConductorTool
+                self._conductor_tool_inst = AIConductorTool(self.config)
+            except Exception as e:
+                self._conductor_tool_inst = None
+                self._failed['conductor'] = str(e)
+        return self._conductor_tool_inst
+
+    def _get_git_sync_tool(self):
+        if not hasattr(self, '_git_sync_tool_inst'):
+            try:
+                from ..github_sync import GitSyncTool
+                self._git_sync_tool_inst = GitSyncTool(self.config)
+            except Exception as e:
+                self._git_sync_tool_inst = None
+                self._failed['git_sync'] = str(e)
+        return self._git_sync_tool_inst
     def execute(self, tool_name: str, params: dict) -> Any:
         """Esegue un tool per nome con i parametri dati."""
         tool = self._tools.get(tool_name)
