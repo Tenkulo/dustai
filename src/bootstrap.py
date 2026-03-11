@@ -145,12 +145,10 @@ class Bootstrap:
             result = fn()
             return result if result is not None else True
         except KeyboardInterrupt:
-            self._print(f"
-  ⏹  Bootstrap interrotto dall'utente durante: {phase_name}")
+            self._print(f"\n  ⏹  Bootstrap interrotto durante: {phase_name}")
             raise
         except Exception as e:
-            self._print(f"
-  ❌ Crash in fase [{phase_name}]: {type(e).__name__}: {e}")
+            self._print(f"\n  ❌ Crash in fase [{phase_name}]: {type(e).__name__}: {e}")
             self._save_crash(e, phase=phase_name, context={"phase": phase_name})
             if critical:
                 self._print(f"  ⚠️  Fase critica fallita — DUST AI potrebbe non avviarsi correttamente")
