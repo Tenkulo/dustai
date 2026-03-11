@@ -65,13 +65,14 @@ class Agent:
 
     def _build_system_prompt(self) -> str:
         import os, platform
-        desktop  = str(self.config.get_desktop())
-        workdir  = str(self.config.get_workdir())
+        desktop   = str(self.config.get_desktop())
+        workdir   = str(self.config.get_workdir())
         downloads = str(self.config.get_downloads())
-        desktop_alt = (
-            f"{os.environ.get('USERPROFILE','C:\\Users\\User')}\\Desktop"
-            if platform.system() == "Windows" else desktop
-        )
+        if platform.system() == "Windows":
+            _up = os.environ.get("USERPROFILE", "C:\\Users\\User")
+            desktop_alt = _up + "\\Desktop"
+        else:
+            desktop_alt = desktop
         return SYSTEM_PROMPT_TEMPLATE.format(
             desktop=desktop, workdir=workdir,
             downloads=downloads, desktop_alt=desktop_alt,
