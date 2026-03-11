@@ -1,95 +1,141 @@
 """
-DUST AI – Tool: file_ops
-Operazioni file affidabili: read, write, list, delete, exists.
-Usa percorsi assoluti. OneDrive-aware su Windows.
+DUST AI – FileOpsTool v2.0
+Operazioni file sicure: read, write, list, delete, copy, move, exists.
 """
-import os
-import shutil
 import logging
+import shutil
 from pathlib import Path
+
+log = logging.getLogger("FileOpsTool")
 
 
 class FileOpsTool:
+    MAX_READ_BYTES = 512 * 1024   # 512 KB max per file_read
+
     def __init__(self, config):
         self.config = config
-        self.log = logging.getLogger("FileOpsTool")
 
-    def get_desktop(self) -> str:
-        """Restituisce il percorso Desktop reale (OneDrive-aware)."""
-        return str(self.config.get_desktop())
-
-    def file_read(self, path: str, encoding: str = "utf-8") -> str:
-        """Legge il contenuto di un file."""
+    def file_read(self, path: str) -> str:
+        p = self._resolve(path)
+        if not p:
+            return "❌ Path non valido: " + str(path)
+        if not p.exists():
+            return "❌ File non trovato: " + str(p)
+        if not p.is_file():
+            return "❌ Non è un file: " + str(p)
         try:
-            p = Path(path)
-            if not p.exists():
-                return f"❌ File non trovato: {path}"
-            content = p.read_text(encoding=encoding, errors="replace")
-            return content if content else "[file vuoto]"
+            size = p.stat().st_size
+            if size > self.MAX_READ_BYTES:
+                return "❌ File troppo grande (" + str(size // 1024) + " KB) — usa sys_exec con type/head"
+            return p.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
-            return f"❌ Errore lettura {path}: {e}"
+            return "❌ Lettura fallita: " + str(e)
 
-    def file_write(self, path: str, content: str, encoding: str = "utf-8", append: bool = False) -> str:
-        """Scrive contenuto in un file. Crea directory se non esiste."""
+    def file_write(self, path: str, content: str, mode: str = "w") -> str:
+        p = self._resolve(path)
+        if not p:
+            return "❌ Path non valido: " + str(path)
         try:
-            p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
-            mode = "a" if append else "w"
-            with open(p, mode, encoding=encoding) as f:
-                f.write(content)
-            return f"✅ File scritto: {path} ({p.stat().st_size} bytes)"
-        except Exception as e:
-            return f"❌ Errore scrittura {path}: {e}"
-
-    def file_list(self, path: str, pattern: str = "*", recursive: bool = False) -> str:
-        """Lista file in una directory."""
-        try:
-            p = Path(path)
-            if not p.exists():
-                return f"❌ Directory non trovata: {path}"
-            if not p.is_dir():
-                return f"❌ Non è una directory: {path}"
-
-            if recursive:
-                files = list(p.rglob(pattern))
+            if mode == "a":
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(content)
+                return "✅ Testo aggiunto a: " + str(p)
             else:
-                files = list(p.glob(pattern))
-
-            if not files:
-                return f"[directory vuota o nessun file con pattern '{pattern}']"
-
-            result = []
-            for f in sorted(files):
-                if f.is_dir():
-                    result.append(f"📁 {f.name}/")
-                else:
-                    size = f.stat().st_size
-                    result.append(f"📄 {f.name} ({size} bytes)")
-
-            return "\n".join(result)
+                p.write_text(content, encoding="utf-8")
+                return "✅ File scritto: " + str(p) + " (" + str(len(content)) + " chars)"
+        except PermissionError:
+            return "❌ Accesso negato: " + str(p)
         except Exception as e:
-            return f"❌ Errore listing {path}: {e}"
+            return "❌ Scrittura fallita: " + str(e)
+
+    def file_list(self, path: str) -> str:
+        p = self._resolve(path)
+        if not p:
+            return "❌ Path non valido: " + str(path)
+        if not p.exists():
+            return "❌ Directory non trovata: " + str(p)
+        try:
+            items   = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+            lines   = []
+            for item in items[:100]:
+                prefix = "[DIR] " if item.is_dir() else "[FILE]"
+                size   = ""
+                if item.is_file():
+                    try:
+                        size = " (" + str(item.stat().st_size) + "b)"
+                    except Exception:
+                        pass
+                lines.append(prefix + " " + item.name + size)
+            if len(items) > 100:
+                lines.append("... (" + str(len(items) - 100) + " altri)")
+            return "\n".join(lines) if lines else "(directory vuota)"
+        except PermissionError:
+            return "❌ Accesso negato: " + str(p)
+        except Exception as e:
+            return "❌ List fallita: " + str(e)
 
     def file_delete(self, path: str) -> str:
-        """Elimina file o directory."""
+        p = self._resolve(path)
+        if not p:
+            return "❌ Path non valido: " + str(path)
+        if not p.exists():
+            return "❌ Non trovato: " + str(p)
         try:
-            p = Path(path)
-            if not p.exists():
-                return f"❌ Non trovato: {path}"
             if p.is_dir():
                 shutil.rmtree(p)
-                return f"✅ Directory eliminata: {path}"
-            else:
-                p.unlink()
-                return f"✅ File eliminato: {path}"
+                return "✅ Directory eliminata: " + str(p)
+            p.unlink()
+            return "✅ File eliminato: " + str(p)
+        except PermissionError:
+            return "❌ Accesso negato: " + str(p)
         except Exception as e:
-            return f"❌ Errore eliminazione {path}: {e}"
+            return "❌ Delete fallita: " + str(e)
 
     def file_exists(self, path: str) -> str:
-        """Verifica se un file o directory esiste."""
-        p = Path(path)
-        if p.exists():
-            kind = "directory" if p.is_dir() else "file"
-            size = p.stat().st_size if p.is_file() else "-"
-            return f"✅ Esiste ({kind}, {size} bytes): {path}"
-        return f"❌ Non esiste: {path}"
+        p = self._resolve(path)
+        if not p:
+            return "false"
+        exists = p.exists()
+        kind   = "directory" if p.is_dir() else "file" if p.is_file() else "unknown"
+        return ("true (" + kind + ")") if exists else "false"
+
+    def file_copy(self, path: str, destination: str) -> str:
+        src  = self._resolve(path)
+        dst  = self._resolve(destination)
+        if not src or not dst:
+            return "❌ Path non valido"
+        if not src.exists():
+            return "❌ Sorgente non trovata: " + str(src)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+            return "✅ Copiato: " + str(src) + " → " + str(dst)
+        except Exception as e:
+            return "❌ Copy fallita: " + str(e)
+
+    def file_move(self, path: str, destination: str) -> str:
+        src = self._resolve(path)
+        dst = self._resolve(destination)
+        if not src or not dst:
+            return "❌ Path non valido"
+        if not src.exists():
+            return "❌ Sorgente non trovata: " + str(src)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            return "✅ Spostato: " + str(src) + " → " + str(dst)
+        except Exception as e:
+            return "❌ Move fallita: " + str(e)
+
+    def _resolve(self, path: str) -> Path:
+        try:
+            p = Path(path.strip())
+            if not p.is_absolute():
+                p = self.config.get_base_path() / p
+            return p
+        except Exception:
+            return None

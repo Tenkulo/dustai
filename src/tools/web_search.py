@@ -1,84 +1,196 @@
 """
-DUST AI – Tool: web_search
-Ricerca web via Perplexity Sonar API.
-Fallback: DuckDuckGo via requests se Perplexity non disponibile.
+DUST AI – WebSearchTool v2.0
+Perplexity Sonar API con:
+- Routing automatico sonar vs sonar-pro per tipo di query
+- Budget cap mensile: max 10 query sonar-pro/mese (€5 budget)
+- Parametri ottimizzati: max_tokens=400, search_context="low"
+- Counter persistente in A:\\dustai_stuff\\memory\\perplexity_usage.json
 """
-import logging
 import json
+import logging
+import time
+import re
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+
+log = logging.getLogger("WebSearchTool")
+
+# Keyword che giustificano sonar-pro (query complesse)
+PRO_KEYWORDS = [
+    "analizza", "confronta", "ricerca approfondita", "spiega in dettaglio",
+    "storia di", "perché", "come funziona", "differenza tra",
+    "analisi", "ricerca", "approfondisci", "spiega", "panoramica",
+    "tutorial", "guida completa", "best practice", "architettura",
+]
+
+MONTHLY_PRO_CAP = 10   # max sonar-pro al mese — €5 budget
 
 
 class WebSearchTool:
     def __init__(self, config):
-        self.config = config
-        self.log = logging.getLogger("WebSearchTool")
+        self.config    = config
+        self._api_key  = config.get_api_key("perplexity")
+        self._usage_f  = config.get_memory_dir() / "perplexity_usage.json"
+        self._usage    = self._load_usage()
 
-    def web_search(self, query: str, model: str = "sonar-pro", max_results: int = 5) -> str:
-        """
-        Cerca informazioni sul web.
-        
-        Usa Perplexity Sonar se API key disponibile,
-        altrimenti DuckDuckGo come fallback.
-        """
-        api_key = self.config.get_api_key("perplexity")
+    # ─── Usage tracking ──────────────────────────────────────────────────────
 
-        if api_key:
-            return self._search_perplexity(query, model, api_key)
+    def _load_usage(self) -> dict:
+        if self._usage_f.exists():
+            try:
+                return json.loads(self._usage_f.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {"month": "", "sonar_count": 0, "sonar_pro_count": 0,
+                "total_cost_usd": 0.0, "queries": []}
+
+    def _save_usage(self):
+        try:
+            self._usage_f.write_text(
+                json.dumps(self._usage, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as e:
+            log.warning("Usage save error: " + str(e))
+
+    def _check_month_reset(self):
+        current_month = datetime.now().strftime("%Y-%m")
+        if self._usage.get("month") != current_month:
+            self._usage = {
+                "month":           current_month,
+                "sonar_count":     0,
+                "sonar_pro_count": 0,
+                "total_cost_usd":  0.0,
+                "queries":         [],
+            }
+            self._save_usage()
+
+    def _select_model(self, query: str) -> str:
+        """Routing automatico: sonar-pro solo per query complesse e se budget disponibile."""
+        self._check_month_reset()
+
+        is_complex = any(kw in query.lower() for kw in PRO_KEYWORDS)
+        pro_used   = self._usage.get("sonar_pro_count", 0)
+
+        if is_complex and pro_used < MONTHLY_PRO_CAP:
+            return "sonar-pro"
+        if is_complex and pro_used >= MONTHLY_PRO_CAP:
+            log.info("sonar-pro cap raggiunto (" + str(MONTHLY_PRO_CAP) + "/mese) → uso sonar")
+        return "sonar"
+
+    def _record_usage(self, model: str, query: str,
+                      input_tokens: int, output_tokens: int):
+        """Registra uso e calcola costo."""
+        cost = 0.0
+        if model == "sonar":
+            cost = (input_tokens / 1_000_000) + (output_tokens / 1_000_000) + 0.005
+        elif model == "sonar-pro":
+            cost = (input_tokens * 3 / 1_000_000) + (output_tokens * 15 / 1_000_000) + 0.006
+
+        if model == "sonar-pro":
+            self._usage["sonar_pro_count"] = self._usage.get("sonar_pro_count", 0) + 1
         else:
-            self.log.warning("Perplexity API key non trovata, uso DuckDuckGo")
-            return self._search_duckduckgo(query)
+            self._usage["sonar_count"] = self._usage.get("sonar_count", 0) + 1
 
-    def _search_perplexity(self, query: str, model: str, api_key: str) -> str:
+        self._usage["total_cost_usd"] = round(
+            self._usage.get("total_cost_usd", 0.0) + cost, 6
+        )
+        self._usage.setdefault("queries", []).append({
+            "ts":    datetime.now().isoformat(),
+            "model": model,
+            "query": query[:100],
+            "cost":  round(cost, 6),
+        })
+        # Mantieni solo ultimi 200 record
+        self._usage["queries"] = self._usage["queries"][-200:]
+        self._save_usage()
+
+    # ─── web_search ──────────────────────────────────────────────────────────
+
+    def web_search(self, query: str, max_results: int = 5,
+                   force_model: str = "") -> list:
+        """
+        Cerca sul web tramite Perplexity Sonar API.
+        Ritorna lista di risultati: [{"title": str, "url": str, "snippet": str}]
+        """
+        if not self._api_key:
+            return [{"error": "❌ PERPLEXITY_API_KEY non configurata in .env"}]
+
+        model = force_model or self._select_model(query)
+        log.info("Perplexity " + model + ": " + query[:60])
+
         try:
             import requests
-            url = "https://api.perplexity.ai/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
+
             payload = {
-                "model": model,
+                "model":   model,
                 "messages": [{"role": "user", "content": query}],
-                "return_citations": True,
-                "search_recency_filter": "month",
+                "max_tokens": 400,
+                "search_context_size":    "low",      # risparmia request fee
+                "return_related_questions": False,    # elimina token inutili
             }
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
-            data = response.json()
+
+            headers = {
+                "Authorization": "Bearer " + self._api_key,
+                "Content-Type":  "application/json",
+            }
+
+            resp = requests.post(
+                "https://api.perplexity.ai/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
             content = data["choices"][0]["message"]["content"]
+            usage   = data.get("usage", {})
+            self._record_usage(
+                model, query,
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+            )
 
-            # Aggiungi citations se presenti
+            # Estrai citazioni se presenti
             citations = data.get("citations", [])
+            results   = []
+
             if citations:
-                content += "\n\nFonti:\n" + "\n".join(f"• {c}" for c in citations[:5])
+                for i, url in enumerate(citations[:max_results]):
+                    results.append({
+                        "title":   "Fonte " + str(i + 1),
+                        "url":     url,
+                        "snippet": content[:300] if i == 0 else "",
+                    })
+            else:
+                # Nessuna citazione → ritorna il testo direttamente
+                results = [{"title": "Risultato", "url": "", "snippet": content}]
 
-            return content
+            # Mostra costo stimato
+            pro_left = MONTHLY_PRO_CAP - self._usage.get("sonar_pro_count", 0)
+            cost_tot = self._usage.get("total_cost_usd", 0.0)
+            log.info(
+                "Search OK | costo mese: $" + str(round(cost_tot, 4)) +
+                " | sonar-pro rimasti: " + str(pro_left)
+            )
+
+            return results
+
         except Exception as e:
-            return f"❌ Errore Perplexity: {e}"
+            log.error("WebSearch error: " + str(e))
+            return [{"error": "❌ Ricerca fallita: " + str(e)}]
 
-    def _search_duckduckgo(self, query: str) -> str:
-        """Fallback DuckDuckGo via HTML scraping."""
-        try:
-            import requests
-            from html.parser import HTMLParser
-
-            url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            response = requests.get(url, headers=headers, timeout=15)
-
-            # Estrai testo base
-            class TextExtractor(HTMLParser):
-                def __init__(self):
-                    super().__init__()
-                    self.text = []
-                    self.in_result = False
-
-                def handle_data(self, data):
-                    if data.strip():
-                        self.text.append(data.strip())
-
-            parser = TextExtractor()
-            parser.feed(response.text)
-            result = " ".join(parser.text[:100])[:2000]
-            return f"[DuckDuckGo] {result}"
-        except Exception as e:
-            return f"❌ Errore ricerca web: {e}"
+    def get_budget_status(self) -> dict:
+        """Ritorna stato budget Perplexity corrente."""
+        self._check_month_reset()
+        return {
+            "month":           self._usage.get("month"),
+            "sonar_queries":   self._usage.get("sonar_count", 0),
+            "sonar_pro_used":  self._usage.get("sonar_pro_count", 0),
+            "sonar_pro_left":  MONTHLY_PRO_CAP - self._usage.get("sonar_pro_count", 0),
+            "total_cost_usd":  round(self._usage.get("total_cost_usd", 0.0), 4),
+            "total_cost_eur":  round(self._usage.get("total_cost_usd", 0.0) * 0.92, 4),
+            "budget_eur":      5.0,
+            "budget_left_eur": round(5.0 - self._usage.get("total_cost_usd", 0.0) * 0.92, 4),
+        }

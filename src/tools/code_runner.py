@@ -1,72 +1,51 @@
 """
-DUST AI – Tool: code_runner
-Esegue codice Python in un processo separato.
-Output catturato e restituito all'agente.
+DUST AI – CodeRunnerTool v2.0
+Esecuzione Python sicura con timeout e capture output.
 """
-import subprocess
 import sys
 import logging
+import subprocess
 import tempfile
-import os
 from pathlib import Path
+
+log = logging.getLogger("CodeRunnerTool")
 
 
 class CodeRunnerTool:
     def __init__(self, config):
         self.config = config
-        self.log = logging.getLogger("CodeRunnerTool")
 
-    def code_run(self, code: str, timeout: int = 30, language: str = "python") -> str:
-        """
-        Esegue codice Python e restituisce l'output.
-        
-        Il codice gira in un processo separato per sicurezza.
-        Lavora nella workdir dell'utente.
-        """
-        if language.lower() not in ("python", "py"):
-            return f"❌ Linguaggio non supportato: {language}. Usa 'python'."
-
-        # Scrivi codice in file temporaneo
+    def code_run(self, code: str, timeout: int = 60) -> str:
+        if not code:
+            return "❌ Codice vuoto"
         try:
             with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".py",
-                delete=False,
-                encoding="utf-8",
-                dir=str(self.config.get_workdir())
+                mode="w", suffix=".py", delete=False,
+                encoding="utf-8", dir=str(self.config.get_base_path() / "cache")
             ) as f:
                 f.write(code)
-                temp_path = f.name
-
-            self.log.info(f"Eseguo codice Python: {temp_path}")
+                tmp_path = f.name
 
             result = subprocess.run(
-                [sys.executable, temp_path],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=str(self.config.get_workdir()),
-                encoding="utf-8",
-                errors="replace",
+                [sys.executable, tmp_path],
+                capture_output=True, text=True,
+                timeout=timeout, encoding="utf-8", errors="replace",
             )
+            Path(tmp_path).unlink(missing_ok=True)
 
-            output = ""
-            if result.stdout.strip():
-                output += result.stdout.strip()
-            if result.stderr.strip():
-                output += f"\n[stderr]\n{result.stderr.strip()}"
-            if result.returncode != 0:
-                output += f"\n[exit code: {result.returncode}]"
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+            code_r = result.returncode
 
-            return output.strip() if output.strip() else "[codice eseguito, nessun output]"
+            if code_r != 0:
+                out = "❌ [exit " + str(code_r) + "]"
+                if stderr:
+                    out += "\n" + stderr[:800]
+                return out
+
+            return stdout or "(nessun output)"
 
         except subprocess.TimeoutExpired:
-            return f"❌ Timeout ({timeout}s) superato"
+            return "❌ Timeout (" + str(timeout) + "s)"
         except Exception as e:
-            return f"❌ Errore esecuzione codice: {e}"
-        finally:
-            # Pulisci file temporaneo
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                pass
+            return "❌ code_run: " + str(e)
