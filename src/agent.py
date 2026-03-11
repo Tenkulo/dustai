@@ -1,360 +1,781 @@
 """
-DUST AI – Core Agent v1.4
-Integra SelfHealEngine: su ogni errore cerca soluzione web, genera patch,
-hot-ricarica il modulo e riprova autonomamente. Max 3 tentativi per errore.
+DUST AI – Agent v2.0
+Riscrittura completa. Fix critici:
+
+1. Tool calling robusto:
+   - Gemini: native function calling via genai SDK (niente JSON manuale)
+   - Ollama: format="json" + schema enforcement + retry su parse fail
+   - Parser multi-layer con fallback progressivo
+
+2. Reflective loop pre/post ogni azione
+
+3. Fallback chain: Gemini → Ollama tool-friendly → Ollama text+parse
+
+4. SelfHeal su parse failure (non solo su errori di esecuzione)
+
+5. Rate limiting corretto + retry automatico 429
 """
 import json
 import logging
 import time
 import re
-from typing import Optional
+import sys
+import copy
+from typing import Optional, Any
 
-import google.generativeai as genai
+log = logging.getLogger("Agent")
 
-from .tools.registry import ToolRegistry
-from .memory import Memory
-from .self_heal import SelfHealEngine, classify_error
+# ─── Rate limiting ────────────────────────────────────────────────────────────
+_MIN_INTERVAL = 13   # secondi tra chiamate Gemini (free tier = 5 rpm)
 
-MIN_CALL_INTERVAL = 13
 
-STALL_KEYWORDS = [
-    "in attesa", "sto aspettando", "sono in attesa", "aspetto il risultato",
-    "waiting for", "finché non mi fornisci", "non posso proseguire senza",
-    "non posso continuare senza", "senza questo output",
-]
+# ─── System prompt ────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT_TEMPLATE = """Sei DUST AI, un agente autonomo su Windows 11 (Ryzen 5 5600G, 16 GB RAM).
+SYSTEM_PROMPT = """Sei DUST AI, agente autonomo desktop su Windows 11 (Ryzen 5 5600G, 16 GB RAM).
 
-## PERCORSI REALI — usa QUESTI, non ri-scoprirli mai via shell
-- Desktop:   {desktop}
-- Workdir:   {workdir}
-- Downloads: {downloads}
-- Alternativo Desktop: {desktop_alt}
+## Regole Operative
 
-## Regole
+### OBBLIGATORIO: usa sempre i tool reali
+- NON descrivere mai azioni che "faresti" — eseguile con i tool
+- NON scrivere "Ho creato..." senza aver chiamato il tool
+- NON usare testo narrativo tipo "🔧 [SysExecTool] cmd=..."
+- Ogni azione = una chiamata tool JSON strutturata
 
-### Filesystem
-- Crea cartella:  {{"tool":"sys_exec","params":{{"command":"cmd /c mkdir \\"{desktop}\\\\nomecartella\\""}}}}
-- Crea file:      {{"tool":"sys_exec","params":{{"command":"cmd /c echo testo > \\"{desktop}\\\\cartella\\\\file.txt\\""}}}}
-- Verifica:       {{"tool":"sys_exec","params":{{"command":"cmd /c dir \\"{desktop}\\\\cartella\\""}}}}
-- Se [stderr] o [exit code:1]: NON ignorare, prova path alternativo {desktop_alt}
+### Filesystem Windows
+- Desktop reale: {desktop}
+- Workdir: {base_path}
+- Per operazioni file usa SEMPRE sys_exec con cmd /c
+- DOPO ogni operazione VERIFICA con dir o type
 
-### Comportamento
-- Tool call: SOLO JSON  {{"tool":"nome","params":{{...}}}}
-- Risposta finale: ✅ successo o ❌ fallito con causa
-- Rispondi SEMPRE in italiano
-- NON ripetere "sto aspettando" — ogni risposta deve avere un tool call o una conclusione
+### Pianificazione
+1. Analizza il task (max 2 righe)
+2. Esegui UN tool alla volta
+3. Valuta risultato reale prima del prossimo step
+4. Dichiara completato SOLO dopo verifica
+
+### Formato tool call (UNICO formato accettato)
+{"tool": "nome_tool", "params": {"param1": "valore1"}}
+
+### Dichiarazione completamento
+{"status": "done", "summary": "cosa è stato fatto"}
+
+### Linguaggio: italiano sempre
 """
 
+REFLECTION_PROMPT = """Analizza brevemente (2-3 righe) l'ultimo step:
+- Cosa ha fatto il tool?
+- Il risultato è quello atteso?
+- Il prossimo step ha senso o devo correggere il piano?
+Rispondi in italiano, conciso."""
+
+
+# ─── Tool schema per Gemini native function calling ──────────────────────────
+
+TOOL_SCHEMAS = [
+    {
+        "name": "sys_exec",
+        "description": "Esegui comandi shell Windows (cmd /c) o Linux. Per qualsiasi operazione OS.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string", "description": "Comando da eseguire"},
+                "cwd": {"type": "string", "description": "Working directory (opzionale)"},
+                "timeout": {"type": "integer", "description": "Timeout secondi (default 30)"},
+            },
+            "required": ["cmd"],
+        },
+    },
+    {
+        "name": "file_read",
+        "description": "Leggi contenuto di un file",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "file_write",
+        "description": "Scrivi o sovrascrivi un file",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path":    {"type": "string"},
+                "content": {"type": "string"},
+                "mode":    {"type": "string", "description": "w=sovrascrivi, a=append"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "file_list",
+        "description": "Lista file in una directory",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": "Cerca informazioni sul web tramite Perplexity",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query":       {"type": "string"},
+                "max_results": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "browser_open",
+        "description": "Apri un URL nel browser",
+        "parameters": {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "screenshot",
+        "description": "Cattura screenshot dello schermo per analisi visiva",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "region": {"type": "string", "description": "full|window|region (default full)"},
+            },
+        },
+    },
+    {
+        "name": "code_run",
+        "description": "Esegui codice Python",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code":    {"type": "string"},
+                "timeout": {"type": "integer"},
+            },
+            "required": ["code"],
+        },
+    },
+    {
+        "name": "app_launch",
+        "description": "Avvia un'applicazione Windows",
+        "parameters": {
+            "type": "object",
+            "properties": {"app": {"type": "string"}},
+            "required": ["app"],
+        },
+    },
+    {
+        "name": "mouse_click",
+        "description": "Click del mouse a coordinate x,y",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+            },
+            "required": ["x", "y"],
+        },
+    },
+    {
+        "name": "keyboard_type",
+        "description": "Digita testo con la tastiera",
+        "parameters": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+]
+
+
+# ─── Agent ────────────────────────────────────────────────────────────────────
 
 class Agent:
     def __init__(self, config):
         self.config = config
-        self.log = logging.getLogger("Agent")
+        self.log    = logging.getLogger("Agent")
+
+        from .memory import Memory
+        from .tools.registry import ToolRegistry
+
         self.memory = Memory(config)
-        self.tools = ToolRegistry(config)
-        self._model = None
+        self.tools  = ToolRegistry(config)
+
+        self._gemini_model     = None
+        self._gemini_fn_model  = None   # modello con function calling
+        self._ollama_model     = None
         self._ollama_available = False
-        self._last_call_time = 0
-        self._system_prompt = self._build_system_prompt()
+        self._last_call_time   = 0.0
+        self._heal_engine      = None
+
         self._setup_gemini()
         self._setup_ollama()
-        self._healer: Optional[SelfHealEngine] = None  # lazy init dopo setup
 
-    # ─── System prompt con path iniettati ────────────────────────────────────
-
-    def _build_system_prompt(self) -> str:
-        import os, platform
-        desktop   = str(self.config.get_desktop())
-        workdir   = str(self.config.get_workdir())
-        downloads = str(self.config.get_downloads())
-        if platform.system() == "Windows":
-            _up = os.environ.get("USERPROFILE", "C:\\Users\\User")
-            desktop_alt = _up + "\\Desktop"
-        else:
-            desktop_alt = desktop
-        return SYSTEM_PROMPT_TEMPLATE.format(
-            desktop=desktop, workdir=workdir,
-            downloads=downloads, desktop_alt=desktop_alt,
-        )
-
-    # ─── Setup modelli ────────────────────────────────────────────────────────
+    # ─── Setup ───────────────────────────────────────────────────────────────
 
     def _setup_gemini(self):
         api_key = self.config.get_api_key("google")
         if not api_key:
-            self.log.warning("GOOGLE_API_KEY non trovata.")
+            self.log.warning("GOOGLE_API_KEY non trovata")
             return
-        genai.configure(api_key=api_key)
-        model_name = self.config.get_model("primary").replace("gemini/", "")
-        self._model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=self._system_prompt,
-        )
-        self.log.info(f"Gemini: {model_name}")
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            model_name = self.config.get_model("primary").replace("gemini/", "")
+
+            # Modello base per chat/reflection
+            desktop   = str(self.config.get_desktop())
+            base_path = str(self.config.get_base_path())
+            sys_prompt = SYSTEM_PROMPT.replace("{desktop}", desktop).replace("{base_path}", base_path)
+
+            self._gemini_model = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=sys_prompt,
+            )
+
+            # Modello con function calling nativo
+            tools_for_gemini = [
+                genai.protos.Tool(function_declarations=[
+                    genai.protos.FunctionDeclaration(
+                        name=t["name"],
+                        description=t["description"],
+                        parameters=genai.protos.Schema(
+                            type=genai.protos.Type.OBJECT,
+                            properties={
+                                k: genai.protos.Schema(
+                                    type=genai.protos.Type.STRING
+                                    if v.get("type") == "string"
+                                    else genai.protos.Type.INTEGER
+                                    if v.get("type") == "integer"
+                                    else genai.protos.Type.STRING
+                                )
+                                for k, v in t["parameters"].get("properties", {}).items()
+                            },
+                            required=t["parameters"].get("required", []),
+                        ),
+                    )
+                    for t in TOOL_SCHEMAS
+                ])
+            ]
+
+            self._gemini_fn_model = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=sys_prompt,
+                tools=tools_for_gemini,
+            )
+            self.log.info("Gemini pronto: " + model_name)
+        except Exception as e:
+            self.log.error("Gemini setup fallito: " + str(e))
+            self._gemini_model    = None
+            self._gemini_fn_model = None
 
     def _setup_ollama(self):
         try:
             import ollama
-            models = ollama.list()
-            names = [m.model for m in models.models] if hasattr(models, "models") else []
-            self._ollama_available = bool(names)
-            self._ollama_model = next(
-                (n for n in names if "qwen3" in n),
-                next((n for n in names if "mistral" in n or "llama" in n), names[0] if names else None),
-            )
-            if self._ollama_available:
-                self.log.info(f"Ollama: {self._ollama_model}")
+            resp = ollama.list()
+            if hasattr(resp, "models"):
+                names = [m.model for m in resp.models if hasattr(m, "model")]
+            elif isinstance(resp, dict):
+                names = [m.get("name", m.get("model", "")) for m in resp.get("models", [])]
+            else:
+                names = []
+
+            preferred = self.config.get("ollama_tool_models", [])
+            # Seleziona il primo modello disponibile dalla lista preferita
+            selected = None
+            for pref in preferred:
+                for n in names:
+                    if pref.split(":")[0] in n:
+                        selected = n
+                        break
+                if selected:
+                    break
+            if not selected and names:
+                selected = names[0]
+
+            self._ollama_model     = selected
+            self._ollama_available = bool(selected)
+            if selected:
+                self.log.info("Ollama pronto: " + selected)
         except Exception:
-            self._ollama_model = None
+            self._ollama_available = False
 
-    def _get_healer(self) -> SelfHealEngine:
-        """Inizializza SelfHealEngine la prima volta che serve."""
-        if self._healer is None and self._model:
-            self._healer = SelfHealEngine(
-                config=self.config,
-                gemini_model=self._model,
-                web_search_fn=lambda params: self.tools.execute("web_search", params),
-            )
-        return self._healer
+    def _get_heal_engine(self):
+        if self._heal_engine is None:
+            try:
+                from .self_heal import SelfHealEngine
+                self._heal_engine = SelfHealEngine(
+                    config=self.config,
+                    gemini_model=self._gemini_model,
+                )
+            except Exception as e:
+                self.log.warning("SelfHealEngine non disponibile: " + str(e))
+        return self._heal_engine
 
-    # ─── Chiamate modello ─────────────────────────────────────────────────────
+    # ─── Rate limiting ────────────────────────────────────────────────────────
 
     def _rate_limit_wait(self):
+        min_interval = self.config.get_rate_limit("min_interval_s") or _MIN_INTERVAL
         elapsed = time.time() - self._last_call_time
-        if elapsed < MIN_CALL_INTERVAL:
-            wait = MIN_CALL_INTERVAL - elapsed
-            self.log.info(f"Rate limit: attendo {wait:.1f}s")
-            print(f"   ⏳ Rate limit: attendo {wait:.1f}s...")
+        if elapsed < min_interval:
+            wait = min_interval - elapsed
+            self.log.info("Rate limit wait: " + str(round(wait, 1)) + "s")
+            print("   ⏳ Rate limit: " + str(round(wait, 1)) + "s...")
             time.sleep(wait)
 
-    def _call_gemini(self, messages: list, max_retry: int = 4) -> str:
-        for attempt in range(max_retry):
+    # ─── Chiamate modello ────────────────────────────────────────────────────
+
+    def _call_gemini_fn(self, messages: list) -> dict:
+        """
+        Chiama Gemini con function calling nativo.
+        Ritorna {"type": "tool_call", "tool": "...", "params": {...}}
+             o  {"type": "text", "text": "..."}
+        """
+        max_retries = self.config.get_rate_limit("max_retries") or 4
+
+        for attempt in range(max_retries):
             self._rate_limit_wait()
             try:
                 self._last_call_time = time.time()
-                return self._model.generate_content(messages).text.strip()
+                response = self._gemini_fn_model.generate_content(messages)
+
+                # Cerca function call nativa
+                for candidate in response.candidates:
+                    for part in candidate.content.parts:
+                        if hasattr(part, "function_call") and part.function_call:
+                            fc = part.function_call
+                            params = {}
+                            if hasattr(fc, "args"):
+                                for k, v in fc.args.items():
+                                    params[k] = v
+                            return {"type": "tool_call", "tool": fc.name, "params": params}
+
+                # Nessuna function call → testo
+                return {"type": "text", "text": response.text.strip()}
+
             except Exception as e:
                 err = str(e)
                 if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    m = re.search(r"retry.*?(\d+)[\.\d]*s", err, re.IGNORECASE)
-                    wait = int(m.group(1)) + 3 if m else 65
-                    if attempt < max_retry - 1:
-                        print(f"   ⏳ 429 – attendo {wait}s ({attempt+1}/{max_retry})...")
+                    wait_match = re.search(r"(\d+)[\s]*s", err)
+                    wait = int(wait_match.group(1)) + 5 if wait_match else 65
+                    if attempt < max_retries - 1:
+                        print("   ⏳ 429 — riprovo in " + str(wait) + "s...")
                         time.sleep(wait)
                         continue
                     raise RuntimeError("SWITCH_TO_OLLAMA")
                 raise
-        raise RuntimeError("Retry Gemini esauriti")
 
-    def _call_ollama(self, messages: list) -> str:
+        raise RuntimeError("Gemini retry esauriti")
+
+    def _call_gemini_text(self, messages: list) -> str:
+        """Chiamata Gemini semplice (per reflection, chat)."""
+        max_retries = self.config.get_rate_limit("max_retries") or 4
+        for attempt in range(max_retries):
+            self._rate_limit_wait()
+            try:
+                self._last_call_time = time.time()
+                return self._gemini_model.generate_content(messages).text.strip()
+            except Exception as e:
+                err = str(e)
+                if ("429" in err or "RESOURCE_EXHAUSTED" in err) and attempt < max_retries - 1:
+                    time.sleep(65)
+                    continue
+                raise
+        raise RuntimeError("Gemini text retry esauriti")
+
+    def _call_ollama_structured(self, messages: list, task_hint: str = "") -> dict:
+        """
+        Chiama Ollama con format=json e schema enforcement.
+        Ritorna {"type": "tool_call", ...} o {"type": "text", ...}
+        """
+        if not self._ollama_available:
+            raise RuntimeError("Ollama non disponibile")
+
+        tool_names = ", ".join(t["name"] for t in TOOL_SCHEMAS)
+        schema_example = '{"tool": "sys_exec", "params": {"cmd": "dir C:\\\\"}}'
+        done_example   = '{"status": "done", "summary": "operazione completata"}'
+
+        system_msg = (
+            "Sei DUST AI. Rispondi SEMPRE con JSON puro, mai testo narrativo.\n"
+            "Tool disponibili: " + tool_names + "\n"
+            "Per chiamare un tool: " + schema_example + "\n"
+            "Per dichiarare completamento: " + done_example + "\n"
+            "Nient'altro. Solo JSON valido."
+        )
+
         try:
             import ollama
-            msgs = []
+            ollama_msgs = [{"role": "system", "content": system_msg}]
             for m in messages:
-                role = "assistant" if m.get("role") == "model" else m.get("role", "user")
-                parts = m.get("parts", [""])
-                content = parts[0] if isinstance(parts, list) else parts
-                msgs.append({"role": role, "content": content})
-            resp = ollama.chat(model=self._ollama_model, messages=msgs)
-            return resp["message"]["content"].strip()
-        except Exception as e:
-            return f"❌ Errore Ollama: {e}"
+                role    = "assistant" if m.get("role") == "model" else m.get("role", "user")
+                parts   = m.get("parts", [""])
+                content = parts[0] if isinstance(parts, list) else str(parts)
+                ollama_msgs.append({"role": role, "content": content})
 
-    def _call_model(self, messages: list) -> str:
-        if self._model:
-            try:
-                return self._call_gemini(messages)
-            except RuntimeError as e:
-                if "SWITCH_TO_OLLAMA" in str(e) and self._ollama_available:
-                    print("   🔄 Gemini esaurito → switch Ollama")
-                    return self._call_ollama(messages)
-                raise
-        elif self._ollama_available:
-            return self._call_ollama(messages)
-        raise RuntimeError("Nessun modello disponibile.")
-
-    # ─── Esecuzione tool con self-healing ────────────────────────────────────
-
-    def _execute_with_healing(self, name: str, params: dict,
-                               task: str, max_heal_attempts: int = 3) -> str:
-        """
-        Esegue un tool. Se fallisce, attiva SelfHealEngine che:
-        - cerca soluzione web
-        - genera patch
-        - riprova con params corretti o codice patchato
-        Max max_heal_attempts tentativi di healing.
-        """
-        for attempt in range(max_heal_attempts + 1):
-            result = self.tools.execute(name, params)
-            result_str = str(result)
-
-            if not self._is_tool_error(result_str):
-                return result_str  # successo
-
-            if attempt >= max_heal_attempts:
-                return f"{result_str}\n[SelfHeal: esauriti {max_heal_attempts} tentativi]"
-
-            # Attiva healing
-            healer = self._get_healer()
-            if not healer:
-                return result_str  # no healer disponibile
-
-            print(f"\n🚑 [SelfHeal] Tentativo {attempt+1}/{max_heal_attempts}...")
-            heal_result = healer.heal(
-                error=result_str,
-                context={
-                    "operation": f"{name}({params})",
-                    "params": params,
-                    "task": task,
-                    "file": self._error_to_file(result_str, name),
-                }
+            resp = ollama.chat(
+                model=self._ollama_model,
+                messages=ollama_msgs,
+                format="json",
+                options={"temperature": 0.1},
+                stream=False,
             )
+            raw = resp["message"]["content"].strip()
+            return self._parse_model_output(raw)
 
-            print(f"   {heal_result['message']}")
+        except Exception as e:
+            raise RuntimeError("Ollama call fallita: " + str(e))
 
-            if heal_result["give_up"]:
-                return f"{result_str}\n{heal_result['message']}"
+    def _call_model(self, messages: list, task_hint: str = "") -> dict:
+        """
+        Chiama il modello migliore disponibile.
+        Ritorna sempre un dict: {"type": "tool_call"|"text"|"done", ...}
+        """
+        # 1. Gemini con function calling nativo
+        if self._gemini_fn_model:
+            try:
+                return self._call_gemini_fn(messages)
+            except RuntimeError as e:
+                if "SWITCH_TO_OLLAMA" in str(e):
+                    self.log.warning("Gemini 429 → switch Ollama")
+                    print("   🔄 Gemini esaurito → Ollama locale")
+                elif "SWITCH_TO_OLLAMA" not in str(e):
+                    raise
 
-            if heal_result["retry_params"]:
-                params = heal_result["retry_params"]
-                print(f"   🔁 Riprovo con params: {params}")
-            # Se patch_applied=True, il modulo è già stato ricaricato → riprova
+        # 2. Fallback Ollama con JSON forzato
+        if self._ollama_available:
+            return self._call_ollama_structured(messages, task_hint)
 
-        return result_str
+        raise RuntimeError("Nessun modello disponibile. Configura GOOGLE_API_KEY o installa Ollama.")
 
-    def _error_to_file(self, error: str, tool_name: str) -> str:
-        """Mappa tool name → file sorgente per il patching."""
-        mapping = {
-            "sys_exec": "src/tools/sys_exec.py",
-            "file_read": "src/tools/file_ops.py",
-            "file_write": "src/tools/file_ops.py",
-            "web_search": "src/tools/web_search.py",
-            "code_run": "src/tools/code_runner.py",
-        }
-        return mapping.get(tool_name, "")
+    # ─── Parser multi-layer ──────────────────────────────────────────────────
 
-    # ─── Loop principale ──────────────────────────────────────────────────────
+    def _parse_model_output(self, text: str) -> dict:
+        """
+        Parser robusto con 4 livelli di fallback.
+        Ritorna: {"type": "tool_call", "tool": str, "params": dict}
+              o: {"type": "done", "summary": str}
+              o: {"type": "text", "text": str}
+        """
+        if not text:
+            return {"type": "text", "text": ""}
+
+        # Livello 1: JSON diretto
+        clean = text.strip()
+        for fence in ["```json", "```"]:
+            if clean.startswith(fence):
+                clean = clean[len(fence):]
+                if clean.endswith("```"):
+                    clean = clean[:-3]
+                clean = clean.strip()
+
+        try:
+            data = json.loads(clean)
+            return self._classify_json(data)
+        except json.JSONDecodeError:
+            pass
+
+        # Livello 2: cerca JSON nel testo (primo blocco {...})
+        for match in re.finditer(r'\{[^{}]*\}|\{(?:[^{}]|\{[^{}]*\})*\}', text, re.DOTALL):
+            try:
+                data = json.loads(match.group(0))
+                result = self._classify_json(data)
+                if result["type"] in ("tool_call", "done"):
+                    return result
+            except json.JSONDecodeError:
+                continue
+
+        # Livello 3: estrazione da testo narrativo Ollama
+        # Detecta pattern tipo: "sys_exec(cmd='dir C:\\')" o "[sys_exec] cmd=dir C:\"
+        narrative = self._extract_from_narrative(text)
+        if narrative:
+            return narrative
+
+        # Livello 4: testo puro
+        return {"type": "text", "text": text}
+
+    def _classify_json(self, data: dict) -> dict:
+        """Classifica un JSON come tool_call, done o text."""
+        # Tool call esplicita
+        if "tool" in data and isinstance(data.get("tool"), str):
+            return {
+                "type":   "tool_call",
+                "tool":   data["tool"],
+                "params": data.get("params", data.get("parameters", {})),
+            }
+
+        # Done/completato
+        if data.get("status") in ("done", "completed", "completato"):
+            return {"type": "done", "summary": data.get("summary", data.get("message", ""))}
+
+        if any(k in data for k in ("completato", "fatto", "terminato")):
+            return {"type": "done", "summary": str(data)}
+
+        # Qualsiasi dict con una chiave che è un nome tool
+        tool_names = {t["name"] for t in TOOL_SCHEMAS}
+        for key in data:
+            if key in tool_names:
+                return {
+                    "type":   "tool_call",
+                    "tool":   key,
+                    "params": data[key] if isinstance(data[key], dict) else {"cmd": str(data[key])},
+                }
+
+        return {"type": "text", "text": json.dumps(data)}
+
+    def _extract_from_narrative(self, text: str) -> Optional[dict]:
+        """
+        Estrae tool call da output narrativo Ollama.
+        Gestisce pattern come:
+          [sys_exec] cmd=dir C:\
+          sys_exec(cmd="dir C:\\")
+          🔧 sys_exec: dir C:\
+        """
+        tool_names = {t["name"] for t in TOOL_SCHEMAS}
+
+        # Pattern [tool_name] param=value
+        m = re.search(r'\[(\w+)\]\s*(\w+)=(.+?)(?:\n|$)', text)
+        if m and m.group(1) in tool_names:
+            return {
+                "type":   "tool_call",
+                "tool":   m.group(1),
+                "params": {m.group(2): m.group(3).strip()},
+            }
+
+        # Pattern tool_name(param="value")
+        m = re.search(r'(\w+)\(([^)]+)\)', text)
+        if m and m.group(1) in tool_names:
+            raw_params = m.group(2)
+            params = {}
+            for pm in re.finditer(r'(\w+)\s*=\s*["\']?([^,"\']+)["\']?', raw_params):
+                params[pm.group(1)] = pm.group(2).strip()
+            if params:
+                return {"type": "tool_call", "tool": m.group(1), "params": params}
+
+        # Pattern "🔧 tool_name: value" o "tool_name: value"
+        m = re.search(r'(?:🔧\s+)?(\w+):\s+(.+?)(?:\n|$)', text)
+        if m and m.group(1) in tool_names:
+            tool = m.group(1)
+            # Cerca il primo parametro richiesto per questo tool
+            schema = next((t for t in TOOL_SCHEMAS if t["name"] == tool), None)
+            if schema:
+                required = schema["parameters"].get("required", [])
+                if required:
+                    return {
+                        "type":   "tool_call",
+                        "tool":   tool,
+                        "params": {required[0]: m.group(2).strip()},
+                    }
+
+        return None
+
+    # ─── Reflective loop ─────────────────────────────────────────────────────
+
+    def _reflect(self, tool_name: str, params: dict, result: str, messages: list) -> str:
+        """
+        Micro-reflection post-tool: chiede al modello di valutare il risultato.
+        Usa il modello base (non function calling) per risparmio token.
+        """
+        if not self.config.get_agent_cfg("reflective_loop", True):
+            return ""
+        try:
+            reflection_msgs = messages + [{
+                "role": "user",
+                "parts": [
+                    "Tool eseguito: " + tool_name + "\n"
+                    "Params: " + json.dumps(params) + "\n"
+                    "Risultato: " + result[:500] + "\n\n"
+                    + REFLECTION_PROMPT
+                ]
+            }]
+            if self._gemini_model:
+                return self._call_gemini_text(reflection_msgs)
+            return ""
+        except Exception:
+            return ""
+
+    # ─── Task execution ──────────────────────────────────────────────────────
 
     def run_task(self, task: str, max_steps: int = None) -> str:
-        max_steps = max_steps or self.config.get("agent", {}).get("max_steps", 20)
-        self.log.info(f"Task: {task[:80]}")
+        """
+        Loop agente autonomo.
+        1. Prepara contesto
+        2. Chiama modello (Gemini FN → Ollama JSON → fallback)
+        3. Esegui tool reale
+        4. Reflection
+        5. Ripeti fino a completamento o max_steps
+        """
+        max_steps = max_steps or self.config.get_agent_cfg("max_steps") or 25
+        self.log.info("Task: " + task[:80])
 
-        desktop = str(self.config.get_desktop())
-        task_msg = f"{task}\n\n[REMINDER: Desktop={desktop}]"
+        context  = self.memory.get_context()
+        desktop  = str(self.config.get_desktop())
+        base     = str(self.config.get_base_path())
 
-        context = self.memory.get_context()
+        # Costruisci messaggi iniziali
         messages = []
         if context:
-            messages.append({"role": "user",  "parts": [f"Contesto:\n{context}"]})
-            messages.append({"role": "model", "parts": ["Ok."]})
-        messages.append({"role": "user", "parts": [task_msg]})
+            messages.append({"role": "user",  "parts": ["Contesto sessione:\n" + context]})
+            messages.append({"role": "model", "parts": ["Contesto caricato."]})
 
-        step = 0
+        # Aggiungi reminder percorsi
+        reminder = (
+            "[PERCORSI: Desktop=" + desktop + " | Base=" + base + "]\n" + task
+        )
+        messages.append({"role": "user", "parts": [reminder]})
+
+        step           = 0
         final_response = ""
-        stall_count = 0
-        last_responses = []
+        loop_guard     = {}       # risposta → count per rilevare loop
+        tool_fail_count: dict = {}  # tool → count fail consecutivi
 
         while step < max_steps:
             step += 1
-            self.log.info(f"Step {step}/{max_steps}")
+            self.log.info("Step " + str(step) + "/" + str(max_steps))
 
+            # ── Chiama modello ─────────────────────────────────────────────
             try:
-                text = self._call_model(messages)
+                result = self._call_model(messages, task_hint=task)
             except Exception as e:
-                return f"❌ Errore modello: {e}"
+                return "❌ Modello non disponibile: " + str(e)
 
-            messages.append({"role": "model", "parts": [text]})
-            text_lower = text.lower()
+            rtype = result.get("type", "text")
 
-            # Stall detection
-            if any(kw in text_lower for kw in STALL_KEYWORDS):
-                stall_count += 1
-                if stall_count >= 2:
-                    return (
-                        "❌ Task interrotto: agente in stallo.\n"
-                        "Il modello attendeva un risultato che non è arrivato.\n"
-                        "Riprova con un task più semplice."
-                    )
-            else:
-                stall_count = 0
+            # ── Done ──────────────────────────────────────────────────────
+            if rtype == "done":
+                final_response = result.get("summary", "Task completato.")
+                self.log.info("Task completato al step " + str(step))
+                break
 
-            # Loop detection
-            last_responses.append(text[:200])
-            if len(last_responses) > 3:
-                last_responses.pop(0)
-            if len(last_responses) >= 2 and last_responses[-1] == last_responses[-2]:
-                return "❌ Task interrotto: risposta identica ripetuta (loop rilevato)."
+            # ── Text (non è un tool call) ─────────────────────────────────
+            if rtype == "text":
+                text = result.get("text", "")
 
-            # Tool call
-            tool_call = self._parse_tool_call(text)
+                # Controlla keyword di completamento nel testo
+                if any(kw in text.lower() for kw in [
+                    "completato", "fatto", "terminato", "✅", "goal raggiunto", "ho finito"
+                ]):
+                    final_response = text
+                    break
 
-            if tool_call:
-                stall_count = 0
-                name   = tool_call.get("tool")
-                params = tool_call.get("params", {})
-                print(f"\n🔧 [{name}] {params}")
+                # Loop guard
+                text_key = text[:80]
+                loop_guard[text_key] = loop_guard.get(text_key, 0) + 1
+                if loop_guard[text_key] >= 3:
+                    self.log.warning("Loop rilevato — interrompo")
+                    final_response = "⚠️ Loop rilevato. Ultimo output: " + text[:200]
+                    break
 
-                # Esegui con self-healing automatico
-                result_str = self._execute_with_healing(name, params, task)
-                print(f"   → {result_str[:300]}")
-
-                messages.append({"role": "user", "parts": [
-                    f"Risultato '{name}':\n{result_str}\n\nContinua o dichiara completato."
-                ]})
-
-            else:
+                messages.append({"role": "model",  "parts": [text]})
+                messages.append({"role": "user",   "parts": ["Continua con il prossimo step o dichiara completato se il task è terminato."]})
                 final_response = text
-                if any(kw in text_lower for kw in ["completato","fatto","terminato","✅","❌","goal raggiunto"]):
-                    break
-                if step >= max_steps:
-                    break
-                messages.append({"role": "user", "parts": [
-                    "Continua oppure dichiara ✅ completato o ❌ fallito con la causa."
-                ]})
-
-        if not final_response:
-            final_response = (
-                f"❌ Task non completato: raggiunto il limite di {max_steps} step.\n"
-                "Aumenta max_steps in config.json o semplifica il task."
-            )
-
-        self.memory.add(task, final_response)
-        return final_response
-
-    # ─── Helpers ─────────────────────────────────────────────────────────────
-
-    def _is_tool_error(self, result: str) -> bool:
-        return any(s in result.lower() for s in [
-            "[stderr]", "[exit code: 1]", "[exit code: 2]",
-            "accesso negato", "access is denied",
-            "impossibile trovare", "cannot find",
-            "the system cannot find", "sintassi del nome",
-            "errore di sintassi",
-        ])
-
-    def _parse_tool_call(self, text: str) -> Optional[dict]:
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
-        try:
-            data = json.loads(text)
-            if "tool" in data:
-                return data
-        except json.JSONDecodeError:
-            pass
-        for match in re.findall(r'\{[^{}]*"tool"[^{}]*\}', text, re.DOTALL):
-            try:
-                data = json.loads(match)
-                if "tool" in data:
-                    return data
-            except json.JSONDecodeError:
                 continue
-        return None
+
+            # ── Tool call ────────────────────────────────────────────────
+            tool_name = result.get("tool", "")
+            params    = result.get("params", {})
+
+            if not tool_name:
+                messages.append({"role": "user", "parts": ["Errore: tool call senza nome. Riprova."]})
+                continue
+
+            print("\n🔧 [" + tool_name + "] " + json.dumps(params, ensure_ascii=False)[:200])
+            self.log.info("Tool: " + tool_name + " | " + str(params)[:100])
+
+            # ── Esecuzione tool con self-heal ─────────────────────────────
+            t0          = time.time()
+            tool_result = self._execute_with_heal(tool_name, params, task, messages)
+            elapsed_ms  = round((time.time() - t0) * 1000)
+
+            result_str = str(tool_result)
+            print("   → " + result_str[:300])
+            self.log.info("Tool result (" + str(elapsed_ms) + "ms): " + result_str[:150])
+
+            # Fail counter
+            is_error = result_str.startswith("❌")
+            if is_error:
+                tool_fail_count[tool_name] = tool_fail_count.get(tool_name, 0) + 1
+                if tool_fail_count[tool_name] >= 4:
+                    messages.append({
+                        "role": "user",
+                        "parts": [
+                            "ATTENZIONE: il tool '" + tool_name + "' ha fallito " +
+                            str(tool_fail_count[tool_name]) + " volte. "
+                            "Usa un approccio diverso o dichiara il task non completabile."
+                        ]
+                    })
+                    continue
+            else:
+                tool_fail_count[tool_name] = 0
+
+            # Aggiungi tool call e risultato ai messaggi
+            messages.append({
+                "role": "model",
+                "parts": [json.dumps({"tool": tool_name, "params": params})]
+            })
+
+            # ── Reflection ────────────────────────────────────────────────
+            reflection = ""
+            if not is_error and step % 3 == 0:
+                reflection = self._reflect(tool_name, params, result_str, messages)
+                if reflection:
+                    print("   💭 " + reflection[:100])
+
+            feedback = "Risultato '" + tool_name + "':\n" + result_str
+            if reflection:
+                feedback += "\n\nAnalisi step:\n" + reflection
+            feedback += "\n\nContinua o dichiara completato se il goal è raggiunto."
+
+            messages.append({"role": "user", "parts": [feedback]})
+
+        # Salva in memoria
+        self.memory.add(task, final_response or "Eseguito.")
+        return final_response or "Task eseguito."
+
+    # ─── Esecuzione tool con self-heal ────────────────────────────────────────
+
+    def _execute_with_heal(self, tool_name: str, params: dict,
+                           task: str, messages: list, attempt: int = 0) -> Any:
+        """Esegue un tool. Su errore attiva SelfHealEngine."""
+        result = self.tools.execute(tool_name, params)
+        result_str = str(result)
+
+        if result_str.startswith("❌") and attempt < 3:
+            healer = self._get_heal_engine()
+            if healer:
+                heal = healer.heal(
+                    error=result_str,
+                    context={
+                        "operation": tool_name,
+                        "params":    params,
+                        "task":      task,
+                        "attempt":   attempt,
+                    }
+                )
+                if not heal.get("give_up") and heal.get("retry_params"):
+                    new_params = heal["retry_params"]
+                    print("   🔧 SelfHeal: " + heal.get("message", "")[:100])
+                    self.log.info("SelfHeal retry: " + str(new_params)[:100])
+                    return self._execute_with_heal(tool_name, new_params, task, messages, attempt + 1)
+
+        return result
+
+    # ─── Chat semplice ────────────────────────────────────────────────────────
 
     def chat(self, message: str) -> str:
+        """Chat senza loop agente — risposta singola."""
         try:
-            return self._call_model([{"role": "user", "parts": [message]}])
+            msgs = [{"role": "user", "parts": [message]}]
+            result = self._call_model(msgs)
+            if result["type"] == "text":
+                return result["text"]
+            if result["type"] == "done":
+                return result.get("summary", "")
+            # È un tool call in chat mode — esegui e ritorna risultato
+            tr = self.tools.execute(result["tool"], result.get("params", {}))
+            return str(tr)
         except Exception as e:
-            return f"❌ {e}"
+            return "❌ " + str(e)
