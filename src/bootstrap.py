@@ -1,15 +1,11 @@
 """
-DUST AI – Bootstrap v1.0
+DUST AI – Bootstrap v1.1
 Esegue ad ogni avvio PRIMA di caricare l'agent.
-Controlla e installa autonomamente tutto il necessario:
-  - Pacchetti Python (pip)
-  - Playwright + browser Chromium
-  - Ollama (scarica installer, avvia servizio)
-  - pywin32 post-install scripts
-  - File .env con API keys
-  - Variabili d'ambiente Windows
-
-Non richiede intervento umano salvo inserimento API keys la prima volta.
+Novità v1.1:
+  - CrashRecovery integrato: ogni crash viene salvato su disco
+  - Al prossimo avvio: legge crash pendenti, usa Gemini per analizzarli,
+    genera e applica patch automaticamente, poi riprova
+  - Ogni fase è wrappata in try/except: un crash non blocca le altre
 """
 import os
 import sys
@@ -19,6 +15,7 @@ import shutil
 import subprocess
 import platform
 import logging
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -77,28 +74,106 @@ class Bootstrap:
             "env":       False,
             "errors":    [],
         }
+        # CrashRecovery: inizializzato dopo (ha bisogno dell'api_key dal .env)
+        self._crash_reporter = None
+
+    def _init_crash_recovery(self):
+        """Inizializza CrashRecovery dopo che .env è stato caricato."""
+        try:
+            from .crash_recovery import CrashRecoveryEngine, CrashReport
+            self._crash_reporter = CrashReport(self.workdir)
+            api_key = self._load_api_key()
+            self._recovery_engine = CrashRecoveryEngine(self.workdir, api_key=api_key)
+        except Exception as e:
+            log.warning(f"CrashRecovery non disponibile: {e}")
+            self._crash_reporter = None
+            self._recovery_engine = None
+
+    def _load_api_key(self) -> str:
+        env_file = self.workdir / ".env"
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                if line.startswith("GOOGLE_API_KEY=") and "inserisci_qui" not in line:
+                    return line.split("=", 1)[1].strip()
+        return os.environ.get("GOOGLE_API_KEY", "")
+
+    def _save_crash(self, error: Exception, phase: str, context: dict = None):
+        """Salva un crash report su disco."""
+        if self._crash_reporter:
+            try:
+                path = self._crash_reporter.save(error, context or {}, phase)
+                self._print(f"  💾 Crash salvato: {path.name}")
+                self._print(f"     Al prossimo avvio verrà risolto automaticamente.")
+            except Exception:
+                pass
 
     def run(self) -> bool:
         """
         Esegue tutti i check e installa ciò che manca.
-        Ritorna True se tutto è pronto per l'avvio.
+        Ogni fase è wrappata: un crash non blocca le fasi successive.
+        Al prossimo avvio, i crash salvati vengono risolti automaticamente.
         """
-        self._print("🚀 DUST AI Bootstrap - Controllo dipendenze...")
+        self._print("🚀 DUST AI Bootstrap v1.1 - Controllo dipendenze...")
         self._print("=" * 55)
 
+        # ── Fase 0: risolvi crash del run precedente ──────────────────────
+        self._run_phase("crash_recovery", self._resolve_previous_crashes)
+
         ok = True
-        ok &= self._check_python_version()
-        ok &= self._install_pip_packages()
-        ok &= self._setup_playwright()
-        ok &= self._setup_env_file()
+        ok &= self._run_phase("python_version",   self._check_python_version,   critical=True)
+        ok &= self._run_phase("pip_packages",      self._install_pip_packages,   critical=True)
+        ok &= self._run_phase("playwright",        self._setup_playwright)
+        ok &= self._run_phase("env_file",          self._setup_env_file)
+
+        # Init crash recovery dopo che .env è disponibile
+        self._init_crash_recovery()
 
         if IS_WINDOWS:
-            self._install_system_software()
-            self._setup_ollama()
-            self._configure_igpu()
+            self._run_phase("system_software", self._install_system_software)
+            self._run_phase("ollama",          self._setup_ollama)
+            self._run_phase("igpu",            self._configure_igpu)
 
         self._print_summary()
         return ok
+
+    def _run_phase(self, phase_name: str, fn, critical: bool = False) -> bool:
+        """
+        Esegue una fase del bootstrap wrappata in try/except.
+        Se crasha: salva il report e continua (a meno che critical=True).
+        """
+        try:
+            result = fn()
+            return result if result is not None else True
+        except KeyboardInterrupt:
+            self._print(f"
+  ⏹  Bootstrap interrotto dall'utente durante: {phase_name}")
+            raise
+        except Exception as e:
+            self._print(f"
+  ❌ Crash in fase [{phase_name}]: {type(e).__name__}: {e}")
+            self._save_crash(e, phase=phase_name, context={"phase": phase_name})
+            if critical:
+                self._print(f"  ⚠️  Fase critica fallita — DUST AI potrebbe non avviarsi correttamente")
+            else:
+                self._print(f"  ↩️  Continuo con le fasi successive...")
+            return False
+
+    def _resolve_previous_crashes(self):
+        """Risolve crash del run precedente prima di fare qualsiasi altra cosa."""
+        try:
+            from .crash_recovery import CrashRecoveryEngine, CrashReport
+            reporter = CrashReport(self.workdir)
+            pending = reporter.load_unresolved()
+            if not pending:
+                return True
+            api_key = self._load_api_key()
+            engine = CrashRecoveryEngine(self.workdir, api_key=api_key)
+            engine.run()
+        except ImportError:
+            pass  # crash_recovery.py non ancora disponibile
+        except Exception as e:
+            log.warning(f"Crash recovery fallita: {e}")
+        return True
 
     # ─── Python version ──────────────────────────────────────────────────────
 
@@ -232,15 +307,21 @@ class Bootstrap:
                 self._warn("  Scarica da: https://ollama.ai  oppure:")
                 self._warn("  winget install Ollama.Ollama")
                 return
-            # Avvia servizio Ollama
+            # Avvia servizio Ollama — NO capture_output per evitare blocchi
             self._print("  ▶  Avvio Ollama serve...")
-            subprocess.Popen(
-                ["ollama", "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0,
-            )
-            time.sleep(3)
+            kwargs = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if IS_WINDOWS:
+                # CREATE_NO_WINDOW solo su Windows, accesso sicuro all'attributo
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            subprocess.Popen(["ollama", "serve"], **kwargs)
+            # Aspetta fino a 10s che il server risponda
+            for _ in range(10):
+                time.sleep(1)
+                if self._is_ollama_running():
+                    break
             ollama_running = self._is_ollama_running()
 
         if not ollama_running:
@@ -249,12 +330,8 @@ class Bootstrap:
 
         self._ok("  Ollama in esecuzione")
 
-        # Controlla modelli disponibili
-        try:
-            import ollama as ol
-            existing = {m.model for m in ol.list().models}
-        except Exception:
-            existing = set()
+        # Controlla modelli disponibili via SDK (struttura compatibile v0.2+)
+        existing = self._ollama_list_models()
 
         for model_name, description in OLLAMA_MODELS:
             short = model_name.split(":")[0]
@@ -264,20 +341,110 @@ class Bootstrap:
                 self.results["models"][model_name] = "ok"
             else:
                 self._print(f"  ⬇  Pull {model_name} ({description})...")
-                try:
-                    result = subprocess.run(
-                        ["ollama", "pull", model_name],
-                        capture_output=True, text=True, timeout=600
-                    )
-                    if result.returncode == 0:
-                        self._ok(f"  {model_name} scaricato")
-                        self.results["models"][model_name] = "pulled"
-                    else:
-                        self._warn(f"  {model_name}: {result.stderr[:80]}")
-                        self.results["models"][model_name] = "failed"
-                except subprocess.TimeoutExpired:
-                    self._warn(f"  {model_name}: timeout download")
-                    self.results["models"][model_name] = "timeout"
+                success = self._ollama_pull_streaming(model_name)
+                if success:
+                    self._ok(f"  {model_name} scaricato")
+                    self.results["models"][model_name] = "pulled"
+                else:
+                    self._warn(f"  {model_name}: pull fallito (vedi log)")
+                    self._warn(f"  Puoi farlo manualmente: ollama pull {model_name}")
+                    self.results["models"][model_name] = "failed"
+
+    def _ollama_list_models(self) -> set:
+        """
+        Ritorna i nomi dei modelli installati.
+        Compatibile con ollama SDK v0.2+ (struttura risposta cambiata).
+        """
+        try:
+            import ollama as ol
+            resp = ol.list()
+            # SDK v0.2+: resp.models è lista di oggetti con .model
+            if hasattr(resp, "models"):
+                return {m.model for m in resp.models if hasattr(m, "model")}
+            # Fallback: risposta dict raw
+            if isinstance(resp, dict) and "models" in resp:
+                return {m.get("name", m.get("model", "")) for m in resp["models"]}
+            return set()
+        except Exception as e:
+            log.warning(f"ollama list fallito: {e}")
+            # Fallback via HTTP diretto
+            try:
+                import requests
+                r = requests.get("http://127.0.0.1:11434/api/tags", timeout=5)
+                data = r.json()
+                return {m.get("name", "") for m in data.get("models", [])}
+            except Exception:
+                return set()
+
+    def _ollama_pull_streaming(self, model_name: str) -> bool:
+        """
+        Scarica un modello Ollama con streaming SDK.
+        - Nessun timeout fisso
+        - Progress in tempo reale (non bufferizza in RAM)
+        - Resume automatico se interrotto (Ollama gestisce i layer già scaricati)
+        - Non crasha su download grandi
+        """
+        try:
+            import ollama as ol
+
+            last_status = ""
+            last_pct = -1
+
+            # stream=True: riceve chunk progressivi, nessun buffer in RAM
+            for progress in ol.pull(model_name, stream=True):
+                # Compatibilità struttura risposta v0.2+
+                if hasattr(progress, "status"):
+                    status   = progress.status or ""
+                    total    = getattr(progress, "total",     0) or 0
+                    completed = getattr(progress, "completed", 0) or 0
+                elif isinstance(progress, dict):
+                    status    = progress.get("status", "")
+                    total     = progress.get("total",     0) or 0
+                    completed = progress.get("completed", 0) or 0
+                else:
+                    continue
+
+                # Calcola percentuale
+                if total > 0:
+                    pct = int(completed / total * 100)
+                else:
+                    pct = 0
+
+                # Stampa solo se cambia di 5% o status cambia (evita spam)
+                if status != last_status or pct >= last_pct + 5:
+                    bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+                    size_mb = f"{completed/1024/1024:.0f}/{total/1024/1024:.0f} MB" if total > 0 else ""
+                    print(f"\r     [{bar}] {pct:3d}% {status[:30]:<30} {size_mb}", end="", flush=True)
+                    last_status = status
+                    last_pct    = pct
+
+            print()  # newline dopo la progress bar
+            return True
+
+        except KeyboardInterrupt:
+            print()
+            self._warn(f"  Pull {model_name} interrotto dall'utente.")
+            self._warn(f"  Riprendi con: ollama pull {model_name}  (riprende dal punto di interruzione)")
+            return False
+        except Exception as e:
+            print()
+            log.warning(f"ollama pull SDK fallito ({e}), tento via subprocess...")
+            # Fallback subprocess SENZA capture_output — output va direttamente al terminale
+            # Nessun timeout: il download può durare ore su rete lenta
+            try:
+                result = subprocess.run(
+                    ["ollama", "pull", model_name],
+                    stdout=None,   # eredita stdout del processo padre → nessun buffering
+                    stderr=None,   # stessa cosa per stderr
+                    timeout=None,  # nessun timeout
+                )
+                return result.returncode == 0
+            except KeyboardInterrupt:
+                self._warn(f"  Pull interrotto. Riprendi con: ollama pull {model_name}")
+                return False
+            except Exception as e2:
+                self._warn(f"  Pull fallito definitivamente: {e2}")
+                return False
 
     # ─── iGPU acceleration ───────────────────────────────────────────────────
 
