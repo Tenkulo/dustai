@@ -1,5 +1,5 @@
 {
-  "attempts": 4,
+  "attempts": 5,
   "last_error": "AttributeError: 'Config' object has no attribute '_DEFAULT_BASE'",
   "last_file": "A:\\dustai\\src\\config.py",
   "patches": []
