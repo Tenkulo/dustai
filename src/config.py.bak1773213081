@@ -91,7 +91,7 @@ class Config:
         bp = (
             base_path
             or os.environ.get("DUSTAI_BASE")
-            or _DEFAULT_BASE
+            or self._DEFAULT_BASE
         )
         self._cfg["base_path"] = bp
 

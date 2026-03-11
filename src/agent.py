@@ -285,7 +285,6 @@ class Agent:
                 names = []
 
             preferred = self.config.get("ollama_tool_models", [])
-            # Seleziona il primo modello disponibile dalla lista preferita
             selected = None
             for pref in preferred:
                 for n in names:
@@ -299,10 +298,18 @@ class Agent:
 
             self._ollama_model     = selected
             self._ollama_available = bool(selected)
+
             if selected:
-                self.log.info("Ollama pronto: " + selected)
-        except Exception:
+                # Usa OllamaCaller con schema enforcement e two-phase thinking
+                from .ollama_caller import OllamaCaller
+                self._ollama_caller = OllamaCaller(model=selected, config=self.config)
+                self.log.info("Ollama pronto: " + selected + " (OllamaCaller v2)")
+            else:
+                self._ollama_caller = None
+        except Exception as e:
             self._ollama_available = False
+            self._ollama_caller    = None
+            self.log.warning("Ollama setup: " + str(e))
 
     def _get_heal_engine(self):
         if self._heal_engine is None:
@@ -432,7 +439,12 @@ class Agent:
     def _call_model(self, messages: list, task_hint: str = "") -> dict:
         """
         Chiama il modello migliore disponibile.
-        Ritorna sempre un dict: {"type": "tool_call"|"text"|"done", ...}
+        Ritorna sempre un dict: {"type": "tool_call"|"text"|"done"|"parse_error", ...}
+
+        Pipeline:
+          1. Gemini con function calling nativo (zero parse fail)
+          2. OllamaCaller (two-phase + schema enforcement + instructor + retry)
+          3. SelfHeal su parse_error
         """
         # 1. Gemini con function calling nativo
         if self._gemini_fn_model:
@@ -442,12 +454,29 @@ class Agent:
                 if "SWITCH_TO_OLLAMA" in str(e):
                     self.log.warning("Gemini 429 → switch Ollama")
                     print("   🔄 Gemini esaurito → Ollama locale")
-                elif "SWITCH_TO_OLLAMA" not in str(e):
+                else:
                     raise
 
-        # 2. Fallback Ollama con JSON forzato
-        if self._ollama_available:
-            return self._call_ollama_structured(messages, task_hint)
+        # 2. OllamaCaller con schema enforcement
+        if self._ollama_available and self._ollama_caller:
+            result = self._ollama_caller.call(messages, task_hint)
+
+            # Se parse fail → SelfHeal immediato (non "Continua")
+            if result.get("type") == "parse_error":
+                raw = result.get("raw", "")
+                self.log.warning("Ollama parse_error → SelfHeal.heal_parse_fail()")
+                print("   🔧 Parse fail rilevato → SelfHeal attivo")
+                healer = self._get_heal_engine()
+                if healer:
+                    healed = healer.heal_parse_fail(raw, messages)
+                    if healed and healed.get("tool"):
+                        return {"type": "tool_call", "tool": healed["tool"], "params": healed.get("params", {})}
+                    if healed and healed.get("status") == "done":
+                        return {"type": "done", "summary": healed.get("summary", "")}
+                # SelfHeal fallito → testo esplicito invece di loop
+                return {"type": "text", "text": "[parse_error] Impossibile estrarre tool call. Raw: " + raw[:200]}
+
+            return result
 
         raise RuntimeError("Nessun modello disponibile. Configura GOOGLE_API_KEY o installa Ollama.")
 
