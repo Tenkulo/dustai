@@ -1,23 +1,28 @@
-# DUST AI – Dipendenze Python
+# DUST AI – Dipendenze Python v1.1
 # Installa con: pip install -r requirements.txt
+# (il bootstrap le installa automaticamente all'avvio)
 
 # ─── Core AI ──────────────────────────────────────────────────────────────────
-google-generativeai>=0.8.0         # Gemini Flash/Pro API
-requests>=2.31.0                    # HTTP per Perplexity, DuckDuckGo
+google-generativeai>=0.8.0
+requests>=2.31.0
+
+# ─── GUI ──────────────────────────────────────────────────────────────────────
+PySide6>=6.6.0
 
 # ─── Computer Use ─────────────────────────────────────────────────────────────
-pyautogui>=0.9.54                   # Controllo mouse e tastiera
-pillow>=10.0.0                      # Screenshot (richiesto da pyautogui)
+pyautogui>=0.9.54
+pillow>=10.0.0
+psutil>=5.9.0
 
 # ─── Browser Automation ───────────────────────────────────────────────────────
-playwright>=1.40.0                  # Browser control (dopo install: playwright install chromium)
+playwright>=1.40.0
 
-# ─── Windows API (opzionale, solo Windows) ────────────────────────────────────
-# pywin32>=306                      # Window focus e API Windows (decommentare se su Windows)
+# ─── Windows API ──────────────────────────────────────────────────────────────
+pywin32>=306
 
-# ─── Ollama (fallback locale) ─────────────────────────────────────────────────
-# ollama>=0.2.0                     # Decommentare se usi Ollama locale
+# ─── Ollama locale ────────────────────────────────────────────────────────────
+ollama>=0.2.0
 
 # ─── Utilità ──────────────────────────────────────────────────────────────────
-python-dotenv>=1.0.0               # Caricamento .env
-colorama>=0.4.6                    # Colori terminale Windows
+python-dotenv>=1.0.0
+colorama>=0.4.6

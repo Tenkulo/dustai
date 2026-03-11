@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 
 # ─── Aggiungi root al sys.path ────────────────────────────────────────────────
-ROOT = Path(__file__).parent.parent
+ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from PySide6.QtWidgets import (

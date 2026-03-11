@@ -1,23 +1,19 @@
 """
-DUST AI – App Orchestrator
-Gestisce il loop principale, carica config, inizializza tutti i moduli.
+DUST AI – App Orchestrator v1.1
+Esegue Bootstrap prima di avviare l'agent.
 """
 import os
 import sys
-import json
 import logging
 from pathlib import Path
 
-from .config import Config
-from .agent import Agent
-from .ui.console import ConsoleUI
-
 
 class DustApp:
-    VERSION = "1.0.0"
+    VERSION = "1.1.0"
     NAME = "DUST AI"
 
     def __init__(self):
+        from .config import Config
         self.config = Config()
         self.agent = None
         self.ui = None
@@ -36,16 +32,51 @@ class DustApp:
         )
         self.log = logging.getLogger("DustApp")
 
-    def run(self):
+    def run(self, skip_bootstrap: bool = False):
         self.log.info(f"=== {self.NAME} v{self.VERSION} avviato ===")
         print(f"\n🤖 {self.NAME} v{self.VERSION}")
         print("=" * 50)
 
-        # Inizializza agent
+        # ── Bootstrap: installa tutto il necessario ──────────────────────────
+        if not skip_bootstrap:
+            try:
+                from .bootstrap import Bootstrap
+                bs = Bootstrap(workdir=self.config.get_workdir(), silent=False)
+                bs.run()
+            except Exception as e:
+                self.log.warning(f"Bootstrap parziale: {e}")
+                print(f"⚠️  Bootstrap: {e}")
+
+        # ── Inizializza agent ────────────────────────────────────────────────
+        from .agent import Agent
         self.agent = Agent(self.config)
 
-        # Inizializza UI (console per ora, GUI in futuro)
-        self.ui = ConsoleUI(self.agent)
+        # ── Scegli UI ────────────────────────────────────────────────────────
+        ui_mode = os.environ.get("DUSTAI_UI", "auto")
 
-        # Avvia loop
-        self.ui.run()
+        if ui_mode == "gui" or (ui_mode == "auto" and self._has_display()):
+            try:
+                from .ui.gui import DustAIWindow
+                from PySide6.QtWidgets import QApplication
+                app = QApplication(sys.argv)
+                app.setStyle("Fusion")
+                window = DustAIWindow(agent=self.agent, config=self.config)
+                window.show()
+                sys.exit(app.exec())
+            except Exception as e:
+                self.log.warning(f"GUI non disponibile ({e}), uso console")
+                self._run_console()
+        else:
+            self._run_console()
+
+    def _run_console(self):
+        from .ui.console import ConsoleUI
+        ui = ConsoleUI(self.agent)
+        ui.run()
+
+    def _has_display(self) -> bool:
+        """Ritorna True se c'è un display disponibile (GUI possibile)."""
+        import platform
+        if platform.system() == "Windows":
+            return True
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
