@@ -1,5 +1,7 @@
 """
-DUST AI – App Orchestrator v1.1
+DUST AI – App Orchestrator v1.2
+app.py NON crea l'agent — lo fa DustAIWindow autonomamente.
+app.py si occupa solo di: bootstrap → scegliere GUI o console.
 """
 import os
 import sys
@@ -8,8 +10,8 @@ from pathlib import Path
 
 
 class DustApp:
-    VERSION = "1.1.0"
-    NAME = "DUST AI"
+    VERSION = "1.2.0"
+    NAME    = "DUST AI"
 
     def __init__(self):
         from .config import Config
@@ -29,10 +31,10 @@ class DustApp:
         )
         self.log = logging.getLogger("DustApp")
 
-    def run(self, skip_bootstrap: bool = False):
+    def run(self, skip_bootstrap=False):
         self.log.info(f"=== {self.NAME} v{self.VERSION} avviato ===")
 
-        # ── Bootstrap ────────────────────────────────────────────────────────
+        # Bootstrap
         if not skip_bootstrap:
             try:
                 from .bootstrap import Bootstrap
@@ -40,47 +42,34 @@ class DustApp:
             except Exception as e:
                 self.log.warning(f"Bootstrap parziale: {e}")
 
-        # ── Agent ────────────────────────────────────────────────────────────
-        from .agent import Agent
-        agent = Agent(self.config)
-
-        # ── UI: legge DUSTAI_UI env var impostata da run.py ──────────────────
+        # Scegli UI
         ui_mode = os.environ.get("DUSTAI_UI", "gui")
-
         if ui_mode == "console":
-            self._run_console(agent)
+            self._run_console()
         else:
-            self._run_gui(agent)
+            self._run_gui()
 
-    def _run_gui(self, agent):
+    def _run_gui(self):
         try:
             from PySide6.QtWidgets import QApplication
             from .ui.gui import DustAIWindow
             qt_app = QApplication.instance() or QApplication(sys.argv)
             qt_app.setStyle("Fusion")
-            window = DustAIWindow()
-            # Inietta agent già inizializzato nella GUI
-            window._agent = agent
-            window._config = self.config
-            # Aggiorna status nella GUI
-            model = self.config.get_model("primary").split("/")[-1]
-            desktop = str(self.config.get_desktop())
-            window._status.setText(f"Online · {model} · Desktop: {desktop}")
-            window._dot.setStyleSheet("color: #50fa7b; font-size: 16px;")
-            window._input.setEnabled(True)
-            window._send_btn.setEnabled(True)
-            window._log("system", f"✅ DUST AI {DustApp.VERSION} pronto")
-            window._log("system", f"🤖 Modello: {model}")
-            window._log("system", f"📁 Desktop: {desktop}")
-            window.show()
+            # DustAIWindow si inizializza da sola (agent, config, tutto)
+            win = DustAIWindow()
+            win.show()
             sys.exit(qt_app.exec())
         except ImportError as e:
-            self.log.warning(f"PySide6 non disponibile ({e}), uso console")
-            self._run_console(agent)
+            self.log.warning(f"PySide6 non disponibile ({e}) — uso console")
+            self._run_console()
         except Exception as e:
             self.log.error(f"GUI crash: {e} — fallback console")
-            self._run_console(agent)
+            import traceback; traceback.print_exc()
+            self._run_console()
 
-    def _run_console(self, agent):
+    def _run_console(self):
+        from .config import Config
+        from .agent import Agent
         from .ui.console import ConsoleUI
+        agent = Agent(self.config)
         ConsoleUI(agent).run()
