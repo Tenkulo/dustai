@@ -1,99 +1,147 @@
 # DUST AI – Troubleshooting
 
-Tutti i problemi incontrati e le soluzioni verificate.
+Tutti i problemi incontrati e le soluzioni verificate. Aggiornato a v1.4.
 
 ---
 
-## ❌ 429 RESOURCE_EXHAUSTED – gemini-2.5-pro
+## ❌ 429 RESOURCE_EXHAUSTED – Gemini
 
 **Sintomo:**
 ```
-Quota exceeded for metric: generate_content_free_tier_requests, limit: 0, model: gemini-2.5-pro
+Quota exceeded for metric: generate_content_free_tier_requests
 ```
 
-**Causa:** gemini-2.5-pro non è disponibile sul free tier Google (limit: 0).
+**Causa:** Free tier Gemini 2.5 Flash: 5 req/min. Gemini 2.5 Pro: limite 0 su free tier.
+
+**Fix automatico (v1.1+):** l'agent aspetta il retry-delay estratto dall'errore e riprova.  
+**Fix manuale:** aspetta qualche minuto, oppure attiva pay-as-you-go su [aistudio.google.com](https://aistudio.google.com).  
+**Fallback:** se Ollama è installato, l'agent switcha automaticamente su `qwen3:8b` locale.
+
+---
+
+## ❌ Desktop non trovato / path sbagliato
+
+**Sintomo:** L'agent crea file in `C:\Users\ugopl\Desktop` invece di `C:\Users\ugopl\OneDrive\Desktop`.
+
+**Causa:** OneDrive reindirizza il Desktop. `%USERPROFILE%\Desktop` è vuoto, quello reale è su OneDrive.
+
+**Fix (v1.3+):** `Config.get_desktop()` rileva automaticamente il path OneDrive e lo inietta nel system prompt. L'agent non deve più usare `echo %USERPROFILE%\Desktop`.
+
+**Verifica manuale:**
+```powershell
+echo %OneDrive%\Desktop
+# deve stampare: C:\Users\ugopl\OneDrive\Desktop
+```
+
+---
+
+## ❌ Agent in loop "sto aspettando il risultato"
+
+**Sintomo:** L'agent ripete 10+ volte "sono in attesa del risultato del comando sys_exec".
+
+**Causa:** Tool call eseguita ma risultato non tornato correttamente al modello.
+
+**Fix (v1.2+):** stall detection — dopo 2 risposte consecutive con "in attesa", l'agent fa abort e mostra il messaggio di errore.
+
+---
+
+## ❌ Ollama pull crasha a metà download
+
+**Sintomo:** Il Bootstrap va in crash durante `ollama pull qwen3:8b`.
+
+**Causa:** `subprocess.run` con timeout fisso — se la rete è lenta o il modello è grande, il processo viene killato.
+
+**Fix temporaneo:** esegui il pull manualmente dal terminale:
+```powershell
+ollama pull qwen3:8b
+# oppure il modello più leggero:
+ollama pull qwen2.5:3b
+```
+**Fix permanente (v1.5 in sviluppo):** migrazione a Ollama SDK con streaming, nessun timeout fisso.
+
+---
+
+## ❌ `No module named 'src'`
+
+**Sintomo:** DUST AI crasha all'avvio con `ModuleNotFoundError: No module named 'src'`.
+
+**Causa:** `gui.py` o `run.py` avviati dalla directory sbagliata, oppure `ROOT` nel path non punta alla root del progetto.
+
+**Fix:** avvia sempre da `A:\dustai`:
+```powershell
+cd A:\dustai
+python run.py
+```
+Oppure usa `run.bat` che imposta la directory correttamente.
+
+---
+
+## ❌ PySide6 non trovato
+
+**Sintomo:** `ImportError: No module named 'PySide6'`
+
+**Fix:** il Bootstrap lo installa automaticamente. Se vuoi farlo manualmente:
+```powershell
+pip install PySide6>=6.6.0
+```
+
+---
+
+## ❌ Playwright / Chromium non installato
+
+**Sintomo:** `playwright._impl._errors.Error: Executable doesn't exist`
 
 **Fix:**
-1. **Immediato**: switcha a `gemini-2.5-flash` in PyGPT (disponibile free tier)
-2. **Permanente**: attiva Pay-as-you-go su [aistudio.google.com](https://aistudio.google.com) → Billing
-
----
-
-## ❌ mkdir / save_file restituisce OK ma non crea nulla
-
-**Sintomo:** Il log mostra `"result": "OK"` ma il file/cartella non esiste su disco.
-
-**Causa:** I tool nativi PyGPT (`mkdir`, `save_file`) a volte non hanno permessi sufficienti su Windows o operano su path virtuali.
-
-**Fix:** Usa **sempre** `sys_exec` con `cmd /c`:
-```
-cmd /c mkdir "C:\Users\ugopl\OneDrive\Desktop\Test"
-cmd /c echo Testo > "C:\Users\ugopl\OneDrive\Desktop\Test\file.txt"
+```powershell
+pip install playwright
+python -m playwright install chromium
 ```
 
 ---
 
-## ❌ Cartella creata in C:\Users\ugopl\Desktop ma non visibile
+## ❌ Ollama non raggiungibile (porta 11434)
 
-**Sintomo:** La cartella esiste in `C:\Users\ugopl\Desktop` ma il Desktop visibile è diverso.
-
-**Causa:** OneDrive reindirizza la cartella Desktop a `C:\Users\ugopl\OneDrive\Desktop`.
-
-**Diagnosi:**
-```
-cmd /c echo %OneDrive%
-```
-
-**Fix:** Usa il percorso OneDrive come Desktop:
-```
-%OneDrive%\Desktop
-oppure
-C:\Users\ugopl\OneDrive\Desktop
-```
-
----
-
-## ❌ Agent dichiara "completato" senza verificare
-
-**Sintomo:** Il modello scrive `goal_update: finished` ma il task non è stato eseguito correttamente.
-
-**Causa:** Comportamento noto di Gemini in agent mode – assume il successo invece di verificare.
-
-**Fix nel prompt:**
-```
-Dopo ogni operazione file, verifica SEMPRE con:
-cmd /c dir "PERCORSO"
-Non dichiarare il task completato prima della verifica.
-```
-
----
-
-## ❌ tool_calls non funzionano su Gemini in PyGPT
-
-**Sintomo:** Il modello genera JSON tool calls ma PyGPT non li esegue.
-
-**Causa:** `"tool_calls": false` nel `models.json` per quel modello.
-
-**Fix:** In `config/models.json`, per `gemini-2.5-flash` e `gemini-2.5-pro` assicurati:
-```json
-"tool_calls": true
-```
-
----
-
-## ❌ Open Interpreter non trova Ollama
-
-**Sintomo:** `ConnectionRefusedError` su `http://localhost:11434`
+**Sintomo:** `ConnectionRefusedError` o `httpx.ConnectError`
 
 **Fix:**
-1. Verifica che Ollama sia in esecuzione: `ollama serve` nel terminale
-2. Verifica il modello scaricato: `ollama list`
-3. Se non c'è qwen3:8b: `ollama pull qwen3:8b`
+```powershell
+# Avvia il servizio Ollama
+ollama serve
+# Verifica modelli
+ollama list
+# Se qwen3:8b non c'è
+ollama pull qwen3:8b
+```
 
 ---
 
-## ❌ PyGPT non legge il models.json aggiornato
+## ❌ iGPU AMD non utilizzata da Ollama
 
-**Causa:** PyGPT carica la config all'avvio. Modifiche a models.json richiedono riavvio.
+**Sintomo:** Ollama usa solo CPU, inferenza lenta.
 
-**Fix:** Chiudi e riapri PyGPT dopo aver sostituito i file in `%APPDATA%\pygpt-net\`.
+**Fix:** imposta le variabili d'ambiente (il Bootstrap lo fa automaticamente):
+```powershell
+[System.Environment]::SetEnvironmentVariable("OLLAMA_GPU_LAYERS", "18", "User")
+[System.Environment]::SetEnvironmentVariable("OLLAMA_NUM_GPU", "1", "User")
+```
+Poi riavvia Ollama.
+
+---
+
+## ❌ GUI apre ma non genera output
+
+**Causa nota pre-v1.2:** `send_message()` nella GUI non chiamava l'agent.  
+**Fix (v1.2+):** `AgentWorker` thread collegato all'agent con hook su `tools.execute` e `_call_model` per output in tempo reale.
+
+---
+
+## ❌ git `&&` non funziona in PowerShell
+
+**Causa:** PowerShell non supporta `&&` come separatore.
+
+**Fix:** esegui i comandi separati:
+```powershell
+git add .
+git commit -m "messaggio"
+git push origin master
+```

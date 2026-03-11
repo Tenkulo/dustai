@@ -1,150 +1,209 @@
-# 🤖 DUST AI – Architettura Universale Cloud Agentica (Zero-Cost) 2026
+# 🤖 DUST AI — Desktop Unified Smart Tool AI
 
-> **ASE 1.0** · Bootstrap Locale · Ryzen 5 5600G + 16 GB RAM · Windows 11  
-> Gemini 2.5 Flash/Pro · Perplexity Sonar · Ollama locale · PyGPT + Open Interpreter
+> **v1.4** · Windows 11 · Ryzen 5 5600G + 16 GB RAM  
+> Gemini 2.5 Flash · Perplexity Sonar · Ollama locale · PySide6 GUI · Self-Healing autonomo
 
 ---
 
-## 📐 Architettura – Visione End-to-End
+## Cos'è DUST AI
 
-```mermaid
-flowchart TD
-    subgraph FASE1["⚡ FASE 1.0 — Bootstrap Locale (ATTIVA)"]
-        PC["Ryzen 5 5600G · 16GB RAM\nWindows 11"]
-        PYGPT["PyGPT\n(UI + Agent Orchestrator)"]
-        OI["Open Interpreter\n(Esecuzione Locale)"]
-        LLM1["gemini-2.5-flash\n(Primario · API)"]
-        LLM2["qwen3:8b via Ollama\n(Fallback · 100% locale)"]
-        TOOLS["Tool Layer\nsys_exec · mkdir · save_file · browser"]
-        PC --> PYGPT --> OI
-        OI --> LLM1
-        OI --> LLM2
-        OI --> TOOLS
-    end
+DUST AI è un agente AI autonomo nativo Windows che:
 
-    subgraph FASE2["☁️ FASE 2.0 — Dual-Tenant K3s (PROSSIMA)"]
-        K3S1["Tenant-1 EU-FRA\nOracle Cloud Free"]
-        K3S2["Tenant-2 US-ASH\nOracle Cloud Free"]
-        CF["Cloudflare Zero-Trust\n+ WireGuard"]
-        ARGO["ArgoCD GitOps\n(questa repo)"]
-        K3S1 <--> CF <--> K3S2
-        ARGO --> K3S1 & K3S2
-    end
+- **Esegue task** sul tuo PC (file, cartelle, browser, app, mouse/tastiera)
+- **Si auto-ripara**: su ogni errore cerca la soluzione online, genera una patch, hot-ricarica il modulo e riprova — senza intervento umano
+- **Non dipende da un solo modello**: usa Gemini 2.5 Flash come primario, switcha automaticamente su Ollama locale se il rate limit è esaurito
+- **Si installa da solo**: il Bootstrap installa pip packages, Playwright/Chromium, scarica i modelli Ollama, configura le variabili iGPU
 
-    subgraph FASE3["🏁 FASE 3.0 — Zero-Carico Permanente"]
-        AGENT["Agent-Core Pod\nSelf-Healing"]
-        BACKUP["Backup Nightly"]
-        PC2["PC Locale\n🟢 ZERO carico"]
-        AGENT --> BACKUP
-        AGENT --> PC2
-    end
+---
 
-    FASE1 -->|migrazione semi-autonoma| FASE2
-    FASE2 -->|autonomia >95%| FASE3
+## Architettura
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    DUST AI v1.4                             │
+│                                                             │
+│  ┌──────────┐    ┌───────────┐    ┌─────────────────────┐  │
+│  │ GUI      │    │  Agent    │    │   SelfHealEngine    │  │
+│  │ PySide6  │───▶│  v1.4     │───▶│  web search + patch │  │
+│  │          │    │           │    │  + hot-reload        │  │
+│  └──────────┘    └─────┬─────┘    └─────────────────────┘  │
+│                        │                                    │
+│              ┌─────────▼──────────┐                        │
+│              │    Tool Registry   │                        │
+│              │  sys_exec          │                        │
+│              │  file_ops          │                        │
+│              │  browser (PW)      │                        │
+│              │  input_control     │                        │
+│              │  web_search        │                        │
+│              │  code_runner       │                        │
+│              │  windows_apps      │                        │
+│              │  roblox            │                        │
+│              └─────────┬──────────┘                        │
+│                        │                                    │
+│         ┌──────────────▼──────────────┐                    │
+│         │         LLM Layer           │                    │
+│         │  gemini-2.5-flash (primario)│                    │
+│         │  gemini-2.5-pro  (pesante)  │                    │
+│         │  qwen3:8b via Ollama        │◀── fallback auto   │
+│         │  mistral-small3.1 (backup)  │                    │
+│         └─────────────────────────────┘                    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 📁 Struttura Repository
+## Struttura Repository
 
 ```
 dustai/
-├── README.md                  # Questo file
-├── .gitignore                 # Windows + Python
-├── config/
-│   ├── models.json            # PyGPT – modelli ottimizzati (Gemini + Perplexity)
-│   ├── profile.json           # PyGPT – profilo Windows ottimizzato
-│   └── open_interpreter.yaml  # Configurazione Open Interpreter
+├── README.md
+├── CHANGELOG.md
+├── .gitignore
+├── requirements.txt           # dipendenze Python
+├── run.py                     # entry point
+├── run.bat                    # launcher Windows
+├── install.bat                # setup iniziale (esegui una volta)
+│
+├── src/
+│   ├── app.py                 # orchestratore: bootstrap → agent → UI
+│   ├── agent.py               # loop agente v1.4 con self-healing integrato
+│   ├── config.py              # config + path OneDrive-aware
+│   ├── memory.py              # memoria breve/lungo termine
+│   ├── bootstrap.py           # auto-install dipendenze all'avvio
+│   ├── self_heal.py           # SelfHealEngine: search + patch + hot-reload
+│   │
+│   ├── tools/
+│   │   ├── registry.py        # dispatcher tool
+│   │   ├── sys_exec.py        # shell Windows (cmd /c)
+│   │   ├── file_ops.py        # file read/write/list/delete
+│   │   ├── browser.py         # Playwright browser
+│   │   ├── input_control.py   # PyAutoGUI mouse + tastiera
+│   │   ├── windows_apps.py    # launch/focus app Windows
+│   │   ├── web_search.py      # Perplexity / DuckDuckGo
+│   │   ├── code_runner.py     # esecuzione Python
+│   │   └── roblox.py          # integrazione Roblox Studio
+│   │
+│   ├── ui/
+│   │   ├── gui.py             # GUI PySide6 con output ragionamenti
+│   │   └── console.py         # UI terminale fallback
+│   │
+│   └── plugins/
+│       ├── base.py            # PluginBase abstract class
+│       └── loader.py          # auto-discovery plugin
+│
 ├── agents/
-│   ├── agent_system_prompt.md # Prompt di sistema principale per Agent mode
-│   ├── agent_fast.md          # Prompt per task veloci (Flash)
-│   └── agent_research.md      # Prompt per ricerca (Perplexity Sonar)
-├── prompts/
-│   ├── file_ops.md            # Prompt ottimizzati per operazioni file Windows
-│   ├── code_gen.md            # Prompt per generazione codice
-│   └── computer_use.md        # Prompt per Computer Use (gemini-2.5-computer-use)
+│   ├── agent_system_prompt.md
+│   ├── agent_fast.md
+│   └── agent_research.md
+│
+├── config/
+│   ├── models.json            # config modelli (legacy PyGPT reference)
+│   └── profile.json
+│
 ├── docs/
-│   ├── fase1.md               # Roadmap e stato Fase 1.0
-│   ├── fase2.md               # Piano migrazione K3s
-│   └── troubleshooting.md     # Fix problemi noti (OneDrive Desktop, 429, ecc.)
-└── logs/                      # Log sessioni agent (gitignored)
+│   ├── fase1.md               # stato Fase 1.0
+│   ├── fase2.md               # piano K3s cloud
+│   └── troubleshooting.md     # fix problemi noti
+│
+└── prompts/
+    ├── file_ops.md
+    └── pygpt_builder_prompt.md
 ```
 
 ---
 
-## ⚙️ Stack Tecnologico
+## Quick Start
 
-| Layer | Tecnologia | Costo |
-|---|---|---|
-| UI + Orchestrazione | PyGPT 2.7.12 | €0 |
-| Modello primario | gemini-2.5-flash (API Google) | €0 free tier |
-| Modello pesante | gemini-2.5-pro (pay-as-you-go) | ~€0.001/query |
-| Ricerca web | Perplexity Sonar Pro | key esistente |
-| Modello locale | qwen3:8b via Ollama | €0 |
-| Fallback locale | mistral-small3.1 via Ollama | €0 |
-| Esecuzione locale | Open Interpreter | €0 |
-| Computer Use | gemini-2.5-computer-use-preview | €0 preview |
-
----
-
-## 🚀 Quick Start
-
-### 1. Clona la repo
-```bash
+### 1. Clona
+```powershell
 git clone https://github.com/Tenkulo/dustai.git
 cd dustai
 ```
 
-### 2. Installa dipendenze
-```bash
-pip install open-interpreter
-# Ollama: https://ollama.ai
-ollama pull qwen3:8b
-ollama pull mistral-small3.1:latest
+### 2. Setup (una volta sola)
+```powershell
+install.bat
+```
+Il setup:
+- Verifica Python 3.10+
+- Installa tutte le dipendenze pip
+- Installa Playwright + Chromium
+- Avvia Bootstrap che installa Ollama e scarica i modelli
+- Crea `%APPDATA%\dustai\.env` e lo apre per inserire le API keys
+
+### 3. Configura API keys
+Apri `%APPDATA%\dustai\.env` e inserisci:
+```
+GOOGLE_API_KEY=la_tua_key_da_aistudio.google.com
+PERPLEXITY_API_KEY=la_tua_key_da_perplexity.ai
 ```
 
-### 3. Configura PyGPT
-- Copia `config/models.json` in `%APPDATA%\pygpt-net\`
-- Copia `config/profile.json` in `%APPDATA%\pygpt-net\`
-- Imposta le API key in PyGPT → Settings → API Keys:
-  - `api_key_google` = la tua Gemini API key
-  - `api_key_perplexity` = la tua Perplexity API key
-
-### 4. Configura Open Interpreter
-```bash
-interpreter --config  # segui il wizard
-# oppure copia config/open_interpreter.yaml
-```
-
-### 5. Verifica il percorso Desktop (Windows + OneDrive)
-In PyGPT Agent mode, esegui:
-```
-Esegui con sys_exec: cmd /c echo %OneDrive%\Desktop
+### 4. Avvia
+```powershell
+run.bat
+# oppure
+python run.py --gui     # GUI PySide6
+python run.py --console # terminale
 ```
 
 ---
 
-## 📊 Stato Fasi
+## Stack Tecnologico
 
-| Fase | Stato | Autonomia |
+| Layer | Tecnologia | Versione | Costo |
+|---|---|---|---|
+| GUI | PySide6 | 6.6+ | €0 |
+| Modello primario | Gemini 2.5 Flash | API Google | €0 free tier |
+| Modello pesante | Gemini 2.5 Pro | API Google | ~€0.001/query |
+| Ricerca web | Perplexity Sonar Pro | API | key esistente |
+| Modello locale | qwen3:8b | Ollama | €0 |
+| Fallback locale | mistral-small3.1 | Ollama | €0 |
+| Browser automation | Playwright + Chromium | 1.40+ | €0 |
+| Computer Use | PyAutoGUI | 0.9+ | €0 |
+| Self-healing | SelfHealEngine custom | v1.0 | €0 |
+
+---
+
+## Funzionalità Self-Healing
+
+Quando un tool fallisce, DUST AI agisce autonomamente:
+
+```
+🔧 [sys_exec] {"command": "cmd /c mkdir C:\Users\...\Desktop\test"}
+   → [stderr] sintassi del nome non corretta [exit code: 1]
+
+🚑 [SelfHeal] Tentativo 1/3...
+   🔍 Ricerca: Python Windows OneDrive Desktop path fix 2024
+   🔍 Ricerca: cmd mkdir stderr sintassi Windows fix
+   💡 Strategia: params_correction (confidence: 87%)
+   📝 Path Desktop errato — OneDrive sposta Desktop
+   ✏️  Params corretti: {"command": "cmd /c mkdir \"C:\Users\ugopl\OneDrive\Desktop\test\""}
+   🔁 Riprovo...
+   → [comando eseguito] ✅
+```
+
+Se la correzione params non basta, genera una **code patch** al file sorgente, mostra il diff, fa **hot-reload** del modulo e riprova — tutto senza riavviare.
+
+---
+
+## Roadmap
+
+| Fase | Stato | Autonomia stimata |
 |---|---|---|
-| 1.0 Bootstrap Locale | 🟡 In corso | ~88% |
-| 1.1 iGPU + qwen3:8b | ⬜ Pianificata | ~93% target |
-| 2.0 Dual-Tenant K3s | ⬜ Pianificata | ~96% target |
-| 3.0 Zero-Carico | ⬜ Futura | >95% target |
+| 1.0 Bootstrap Locale | ✅ Attiva | ~88% |
+| 1.1 GUI + SelfHeal + Bootstrap auto | 🟡 In rilascio | ~93% |
+| 1.2 Ollama pull resiliente + crash recovery | 🟡 In sviluppo | ~94% |
+| 2.0 Dual-Tenant K3s (Oracle EU-FRA + US-ASH) | ⬜ Pianificata | ~96% |
+| 3.0 Zero-Load Permanente | ⬜ Futura | >98% |
 
 ---
 
-## 🐛 Problemi Noti e Fix
+## Problemi Noti
 
-Vedi [`docs/troubleshooting.md`](docs/troubleshooting.md) per soluzioni a:
-- 429 RESOURCE_EXHAUSTED Gemini (free tier limit)
-- `sys_exec` vs `mkdir`/`save_file` su Windows
-- Desktop non trovato (OneDrive path redirect)
-- `tool_calls: false` su modelli Gemini
+Vedi [`docs/troubleshooting.md`](docs/troubleshooting.md)
 
 ---
 
-## 📜 Licenza
+## Licenza
 
-MIT – Libero uso personale e commerciale.
+MIT — libero uso personale e commerciale.
