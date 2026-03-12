@@ -52,7 +52,7 @@ class DustApp:
     def _run_gui(self):
         try:
             from PySide6.QtWidgets import QApplication
-            from .ui.gui import DustAIWindow
+            from src.ui.gui import DustApp, launch
             qt_app = QApplication.instance() or QApplication(sys.argv)
             qt_app.setStyle("Fusion")
             # DustAIWindow si inizializza da sola (agent, config, tutto)

@@ -1,4 +1,48 @@
 """
+DUST AI – GUI PATCH v2.0
+=========================
+Sostituisce la GUI attuale con una chat moderna, pulita e universale.
+Ispirata a Claude / ChatGPT: nessuna interfaccia a "task", solo conversazione.
+
+Esegui: python A:\\dustai\\DUST_GUI_PATCH.py
+"""
+import ast, shutil, time, subprocess, sys
+from pathlib import Path
+from datetime import datetime
+
+BASE = Path(r"A:\dustai")
+SRC  = BASE / "src"
+UI   = SRC / "ui"
+BAK  = Path(r"A:\dustai_stuff\patches")
+BAK.mkdir(parents=True, exist_ok=True)
+UI.mkdir(exist_ok=True)
+
+def bak(f):
+    p = Path(f)
+    if p.exists():
+        shutil.copy2(p, BAK / (p.stem + ".bak_" + str(int(time.time())) + p.suffix))
+
+def write(path, content, label):
+    try:
+        ast.parse(content)
+        Path(path).write_text(content, encoding="utf-8")
+        print(f"  ✅ {label}")
+        return True
+    except SyntaxError as e:
+        print(f"  ❌ SINTASSI {label}: {e}")
+        return False
+
+print("=" * 60)
+print("DUST AI – GUI PATCH v2.0")
+print("=" * 60)
+
+# ══════════════════════════════════════════════════════════════
+# GUI NUOVA – src/ui/gui.py
+# ══════════════════════════════════════════════════════════════
+print("\n[1/2] Nuova GUI (chat moderna)")
+bak(UI / "gui.py")
+
+GUI_CODE = r'''"""
 DUST AI – GUI v2.0
 Chat moderna e universale. Nessun task fisso: parla e basta.
 """
@@ -630,3 +674,106 @@ def launch(agent):
     window = DustApp(agent)
     window.show()
     return app.exec()
+'''
+
+write(UI / "gui.py", GUI_CODE, "gui.py")
+
+# ══════════════════════════════════════════════════════════════
+# FIX app.py – usa il nuovo launch()
+# ══════════════════════════════════════════════════════════════
+print("\n[2/2] Patching app.py")
+APP = SRC / "app.py"
+if not APP.exists():
+    APP = BASE / "app.py"
+
+if APP.exists():
+    src = APP.read_text(encoding="utf-8")
+    bak(APP)
+    changed = False
+
+    # Assicurati che importi il nuovo gui.py
+    old_imports = [
+        "from src.ui.gui import DustAIWindow",
+        "from src.ui.gui import DUSTAIGUI",
+        "from .ui.gui import DustAIWindow",
+        "from ui.gui import DustAIWindow",
+    ]
+    for old in old_imports:
+        if old in src:
+            src = src.replace(old, "from src.ui.gui import DustApp, launch")
+            changed = True
+
+    # Sostituisci la creazione della finestra
+    import re as _re
+    # Pattern: window = DustAIWindow(agent) / window.show() / sys.exit(app.exec())
+    patterns_to_fix = [
+        # Vecchio pattern window = DustAIWindow(...)
+        (r'window\s*=\s*DustAIWindow\([^)]*\)\s*\n\s*window\.show\(\)\s*\n\s*(?:sys\.exit\()?app\.exec\(\)',
+         'sys.exit(launch(agent))'),
+        (r'window\s*=\s*DUSTAIGUI\([^)]*\)\s*\n\s*window\.show\(\)',
+         'sys.exit(launch(agent))'),
+        # Pattern con app.exec()
+        (r'DustAIWindow\(agent\)',
+         'DustApp(agent)'),
+    ]
+    for pat, repl in patterns_to_fix:
+        new_src = _re.sub(pat, repl, src, flags=_re.DOTALL)
+        if new_src != src:
+            src = new_src
+            changed = True
+
+    # Assicurati che launch() venga chiamato
+    if "launch(" not in src and "DustApp" not in src:
+        # Aggiungi avvio manuale alla fine
+        src += "\n\n# Auto-avvio GUI\nif __name__ == '__main__':\n    from src.ui.gui import launch\n    import sys\n    sys.exit(launch(agent))\n"
+        changed = True
+
+    if changed:
+        try:
+            import ast as _ast
+            _ast.parse(src)
+            APP.write_text(src, encoding="utf-8")
+            print("  ✅ app.py aggiornato")
+        except SyntaxError as e:
+            print(f"  ❌ Sintassi app.py: {e}")
+            print("  ⚠️  Patch app.py manuale richiesta")
+    else:
+        print("  ⏭️  app.py (nessun pattern trovato – verifica manualmente)")
+        print(f"  ℹ️  Assicurati che app.py chiami: from src.ui.gui import launch")
+else:
+    print("  ⚠️  app.py non trovato")
+
+# ── Commit ─────────────────────────────────────────────────────────────
+print("\nCommit...")
+ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+for cmd in [
+    ["git", "add", "-A"],
+    ["git", "commit", "-m", f"feat: GUI v2.0 – chat moderna, dark, universale {ts}"],
+    ["git", "push", "origin", "master"],
+]:
+    r = subprocess.run(cmd, cwd=str(BASE), capture_output=True,
+                       text=True, encoding="utf-8")
+    out = r.stderr or r.stdout or ""
+    ok  = r.returncode == 0 or "nothing" in out or "up to date" in out
+    print(f"  {'✅' if ok else '⚠️ '} {' '.join(cmd[:2])}")
+
+print("""
+╔══════════════════════════════════════════════════════════════╗
+║  DUST GUI v2.0 – INSTALLATA                                 ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  Riavvia DUST:  A:\\dustai\\run.bat                          ║
+║                                                              ║
+║  COSA È CAMBIATO:                                            ║
+║  ✅ Interfaccia chat pura (nessun "task queue")             ║
+║  ✅ Dark theme professionale                                 ║
+║  ✅ Bolle per utente / DUST / tool call / risultati         ║
+║  ✅ Input multi-riga (Shift+Invio = a capo)                 ║
+║  ✅ Pulsante Stop per interrompere                          ║
+║  ✅ Status bar minima (pensando / pronto / errore)          ║
+║  ✅ Pulsante "Nuova chat" per resettare                     ║
+║  ✅ Tool call visibili inline (⚙ nome → risultato)         ║
+║  ✅ Scroll automatico                                        ║
+║  ✅ Universale: qualsiasi messaggio, qualsiasi task         ║
+╚══════════════════════════════════════════════════════════════╝
+""")
