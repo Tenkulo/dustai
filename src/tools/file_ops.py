@@ -49,7 +49,20 @@ class FileOpsTool:
         except Exception as e:
             return "❌ Scrittura fallita: " + str(e)
 
-    def file_list(self, path: str) -> str:
+    def file_list(self, path: str, recursive: bool = False, pattern: str = "*") -> str:
+        p = Path(path)
+        if not p.exists():
+            return "Path non trovato: " + path
+        try:
+            if recursive:
+                items = sorted(p.rglob(pattern))
+            else:
+                items = sorted(p.glob(pattern))
+            lines = [str(i.relative_to(p)) for i in items]
+            return "\n".join(lines) if lines else "(vuoto)"
+        except Exception as e:
+            return "Errore file_list: " + str(e)
+        # --- originale ---
         p = self._resolve(path)
         if not p:
             return "❌ Path non valido: " + str(path)

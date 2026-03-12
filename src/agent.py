@@ -287,7 +287,7 @@ class Agent:
             else:
                 names = []
 
-            preferred = self.config.get("ollama_tool_models", [])
+            preferred = self.config.get("ollama_tool_models", []) or ["qwen3:8b", "mistral-small3.1", "qwen3", "mistral"]
             selected = None
             for pref in preferred:
                 for n in names:
@@ -376,9 +376,28 @@ class Agent:
             except Exception as e:
                 err = str(e)
                 if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    # Switch immediato invece di 3× 65s
+                    if attempt == 0:
+                        # Prova Gemini Lite (KEY_2) prima di arrendersi
+                        try:
+                            import os, google.generativeai as _gen
+                            _key2 = os.environ.get("GOOGLE_API_KEY_2", "")
+                            if _key2:
+                                _gen.configure(api_key=_key2)
+                                _lite = _gen.GenerativeModel("gemini-2.5-flash")
+                                _r2 = _lite.generate_content(messages[-1].get("parts", [""])[0] if messages else "continua")
+                                try:
+                                    _t = _r2.text.strip()
+                                    if _t:
+                                        self.log.info("Gemini KEY_2 fallback OK")
+                                        return {"type": "text", "text": _t}
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                     wait_match = re.search(r"(\d+)[\s]*s", err)
                     wait = min(65, int(wait_match.group(1)) + 5) if wait_match else 65
-                    if attempt < max_retries - 1:
+                    if attempt < min(1, max_retries - 1):  # max 1 retry
                         print("   ⏳ 429 — riprovo in " + str(wait) + "s...")
                         time.sleep(wait)
                         continue

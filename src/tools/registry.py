@@ -27,12 +27,12 @@ class ToolRegistry:
         tool_classes = {
             
             # Orchestra AI
-            'ai_ask':     lambda p: (self._get_conductor_tool().ai_ask(**p) if self._get_conductor_tool() else 'N/D'),
-            'ai_parallel':lambda p: (self._get_conductor_tool().ai_parallel(**p) if self._get_conductor_tool() else 'N/D'),
+            'ai_ask':     lambda p: (self._get_conductor_tool().ai_ask(**self._safe_params(p)) if self._get_conductor_tool() else 'N/D'),
+            'ai_parallel':lambda p: (self._get_conductor_tool().ai_parallel(**self._safe_params(p)) if self._get_conductor_tool() else 'N/D'),
             'ai_status':  lambda p: (self._get_conductor_tool().ai_status() if self._get_conductor_tool() else 'N/D'),
-            'ai_models':  lambda p: (self._get_conductor_tool().ai_models(**p) if self._get_conductor_tool() else 'N/D'),
-            'git_sync':   lambda p: (self._get_git_sync_tool().git_sync(**p) if self._get_git_sync_tool() else 'N/D'),
-            'git_commit': lambda p: (self._get_git_sync_tool().git_commit(**p) if self._get_git_sync_tool() else 'N/D'),
+            'ai_models':  lambda p: (self._get_conductor_tool().ai_models(**self._safe_params(p)) if self._get_conductor_tool() else 'N/D'),
+            'git_sync':   lambda p: (self._get_git_sync_tool().git_sync(**self._safe_params(p)) if self._get_git_sync_tool() else 'N/D'),
+            'git_commit': lambda p: (self._get_git_sync_tool().git_commit(**self._safe_params(p)) if self._get_git_sync_tool() else 'N/D'),
             'git_status': lambda p: (self._get_git_sync_tool().git_status() if self._get_git_sync_tool() else 'N/D'),
             'git_push':   lambda p: (self._get_git_sync_tool().git_push() if self._get_git_sync_tool() else 'N/D'),
             "sys_exec": SysExecTool,
@@ -74,6 +74,26 @@ class ToolRegistry:
 
 
     # ── Orchestra AI / GitHub tools (v2.0) ──
+
+    @staticmethod
+    def _safe_params(p):
+        """Assicura che p sia un dict prima di usarlo come **kwargs."""
+        if isinstance(p, dict):
+            return p
+        if hasattr(p, "__dict__"):
+            return vars(p)
+        return {}
+
+
+    def _normalize_params(self, params):
+        """Normalizza params a dict sicuro."""
+        if params is None:
+            return {}
+        if isinstance(params, dict):
+            return params
+        if hasattr(params, "__dict__"):
+            return {k: v for k, v in vars(params).items() if not k.startswith("_")}
+        return {}
     def _get_conductor_tool(self):
         if not hasattr(self, '_conductor_tool_inst'):
             try:
