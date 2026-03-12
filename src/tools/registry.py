@@ -77,11 +77,16 @@ class ToolRegistry:
 
     @staticmethod
     def _safe_params(p):
-        """Assicura che p sia un dict prima di usarlo come **kwargs."""
+        """Converte p in dict sicuro per **kwargs, filtrando attributi privati."""
+        if p is None:
+            return {}
         if isinstance(p, dict):
-            return p
+            return {k: v for k, v in p.items()
+                    if isinstance(k, str) and not k.startswith("_")}
         if hasattr(p, "__dict__"):
-            return vars(p)
+            return {k: v for k, v in vars(p).items()
+                    if isinstance(k, str) and not k.startswith("_")
+                    and isinstance(v, (str, int, float, bool, list, type(None)))}
         return {}
 
 
