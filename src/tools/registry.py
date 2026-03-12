@@ -62,6 +62,12 @@ class ToolRegistry:
         # Istanze singleton per tool dello stesso modulo
         _instances = {}
         for name, cls in tool_classes.items():
+            # Lambda: registra direttamente senza istanziare
+            if callable(cls) and not isinstance(cls, type):
+                self._tools[name] = cls
+                self.log.info(f"Tool caricato: {name}")
+                continue
+            # Classe: istanzia con config (singleton per classe)
             cls_name = cls.__name__
             if cls_name not in _instances:
                 try:
