@@ -27,12 +27,12 @@ class ToolRegistry:
         tool_classes = {
             
             # Orchestra AI
-            'ai_ask':     lambda p: (self._get_conductor_tool().ai_ask(**self._safe_params(p)) if self._get_conductor_tool() else 'N/D'),
-            'ai_parallel':lambda p: (self._get_conductor_tool().ai_parallel(**self._safe_params(p)) if self._get_conductor_tool() else 'N/D'),
+            'ai_ask':     lambda p: (self._get_conductor_tool().ai_ask(**self._safe_params(p)) if self._get_conductor_tool() and self._safe_params(p).get('prompt') else ('N/D' if not self._get_conductor_tool() else 'Uso: ai_ask prompt="..." model=auto')),
+            'ai_parallel':lambda p: (self._get_conductor_tool().ai_parallel(**self._safe_params(p)) if self._get_conductor_tool() and self._safe_params(p).get('prompt') else ('N/D' if not self._get_conductor_tool() else 'Uso: ai_parallel prompt="..." models="gemini,claude"')),
             'ai_status':  lambda p: (self._get_conductor_tool().ai_status() if self._get_conductor_tool() else 'N/D'),
             'ai_models':  lambda p: (self._get_conductor_tool().ai_models(**self._safe_params(p)) if self._get_conductor_tool() else 'N/D'),
             'git_sync':   lambda p: (self._get_git_sync_tool().git_sync(**self._safe_params(p)) if self._get_git_sync_tool() else 'N/D'),
-            'git_commit': lambda p: (self._get_git_sync_tool().git_commit(**self._safe_params(p)) if self._get_git_sync_tool() else 'N/D'),
+            'git_commit': lambda p: (self._get_git_sync_tool().git_commit(**self._safe_params(p)) if self._get_git_sync_tool() and self._safe_params(p).get('message') else ('N/D' if not self._get_git_sync_tool() else 'Uso: git_commit message="..."')),
             'git_status': lambda p: (self._get_git_sync_tool().git_status() if self._get_git_sync_tool() else 'N/D'),
             'git_push':   lambda p: (self._get_git_sync_tool().git_push() if self._get_git_sync_tool() else 'N/D'),
             "sys_exec": SysExecTool,
