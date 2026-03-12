@@ -1,206 +1,133 @@
-"""DUST AI – AIConductor v2.0"""
-import logging, time, json, threading
+"""DUST AI – AIConductor v2.0
+Orchestratore centrale: sceglie se usare singolo modello, parallelo, o HumanResearcher.
+"""
+import logging, time, threading
 from pathlib import Path
-from datetime import datetime
 log = logging.getLogger("AIConductor")
 
 MODEL_ALIASES = {
-    "gemini": "gemini/gemini-2.5-flash",
-    "gemini_pro": "gemini/gemini-2.5-pro",
-    "gemini3": "gemini/gemini-2.5-pro",
-    "claude": "openrouter/anthropic/claude-sonnet-4-6",
-    "gpt": "openrouter/openai/gpt-5.2",
-    "grok": "openrouter/x-ai/grok-4",
-    "deepseek": "openrouter/deepseek/deepseek-v3",
-    "ollama": "ollama/qwen3:8b",
-    "free": "gemini/gemini-2.5-flash",
-    "lite": "gemini/gemini-2.5-flash-lite",
+    "auto":"auto","gemini":"gemini/gemini-2.5-flash","gemini3":"gemini/gemini-2.5-pro",
+    "claude":"openrouter/anthropic/claude-sonnet-4-6","gpt":"openrouter/openai/gpt-5.2",
+    "grok":"openrouter/x-ai/grok-4","deepseek":"openrouter/deepseek/deepseek-v3",
+    "ollama":"ollama/qwen3:8b","local":"ollama/qwen3:8b","free":"auto",
+    "browser":"browser/gemini",
 }
 
 
 class AIConductor:
     def __init__(self, config):
-        self.config = config
-        self._memory = config.get_base_path() / "memory"
-        self._memory.mkdir(exist_ok=True)
-        self._gateway = None
-        self._git_sync = None
-        self._task_count = self._load_task_count()
+        self.config    = config
+        self._gw       = None
+        self._research = None
+        self._n_tasks  = 0
 
-    def _gw(self):
-        if not self._gateway:
-            from .ai_gateway import AIGateway
-            self._gateway = AIGateway(self.config)
-        return self._gateway
-
-    def _git(self):
-        if not self._git_sync:
-            from .github_sync import GitHubSync
-            self._git_sync = GitHubSync(self.config)
-        return self._git_sync
-
-    def ask(self, prompt, mode="auto", model="auto", task_type="auto", context=""):
-        start = time.time()
-        full_prompt = ("CONTESTO:\n" + context[:4000] + "\n\nRICHIESTA:\n" + prompt) if context else prompt
+    def ask(self, prompt: str, model="auto", mode="auto") -> dict:
+        """Singola domanda a un modello."""
+        gw = self._gateway()
         if model != "auto":
-            resolved = MODEL_ALIASES.get(model.lower(), model)
-            result = self._gw().call(resolved, full_prompt)
+            mid = MODEL_ALIASES.get(model.lower(), model)
+            r   = gw.call(mid, prompt)
         else:
-            result = self._gw().call_auto(full_prompt, task_type, mode)
-        result["latency_total_s"] = round(time.time() - start, 2)
-        self._task_count += 1
-        self._save_task_count()
-        if self._task_count % 10 == 0:
-            self._trigger_self_improvement()
-        return self._normalize(result)
+            r = gw.call_auto(prompt)
+        self._n_tasks += 1
+        return r
 
-    def ask_parallel(self, prompt, models=None, task_type="auto"):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        gw = self._gw()
+    def ask_parallel(self, prompt: str, models: list = None) -> dict:
+        """Chiede a più modelli in parallelo, ritorna la risposta più completa."""
+        from .ai_router import MODELS as ALL_MODELS, ROUTES
+        gw = self._gateway()
         if not models:
-            router = gw.router
-            if task_type == "auto":
-                task_type = router.classify(prompt)
-            models = router.get_route(task_type, "cascade")[:3]
-        if len(models) < 2:
-            return self.ask(prompt, task_type=task_type)
-        results = {}
-        with ThreadPoolExecutor(max_workers=len(models)) as ex:
-            futures = {ex.submit(gw.call, m, prompt): m for m in models}
-            for future in as_completed(futures, timeout=45):
-                mid = futures[future]
-                try:
-                    r = future.result(timeout=5)
-                    if r.get("ok"):
-                        results[mid] = r
-                except Exception:
-                    pass
-        if not results:
-            return {"ok": False, "text": "", "error": "Tutti i modelli falliti", "model": "?"}
-        best = max(results, key=lambda m: len(results[m].get("text", "")))
-        res = self._normalize(results[best])
-        res["parallel_count"] = len(results)
-        res["all_models"] = list(results.keys())
-        return res
+            # Usa i migliori 3 free disponibili
+            models = [m for m in ROUTES["parallel"]
+                      if gw.router._available(m)][:3]
+        results = gw.call_parallel(prompt, models)
+        ok = [r for r in results if r.get("ok")]
+        if not ok:
+            return {"ok": False, "error": "tutti falliti", "text": ""}
+        best = max(ok, key=lambda r: len(r.get("text","")))
+        self._n_tasks += 1
+        return {"ok": True, "text": best["text"],
+                "model": best.get("model_id","?"),
+                "n_ok": len(ok), "n_total": len(results)}
 
-    def _normalize(self, result):
-        if result.get("ok"):
-            return {"ok": True, "text": result.get("text", ""),
-                    "model": result.get("model_id", result.get("model", "?")),
-                    "meta": {k: v for k, v in result.items() if k not in ("ok", "text", "model_id", "model")}}
-        return {"ok": False, "text": "", "error": result.get("error", "errore"),
-                "model": result.get("model_id", "?"), "meta": {}}
+    def research(self, task: str, use_web=True) -> dict:
+        """Ricerca completa (web + multi-AI + sintesi)."""
+        return self._researcher().research(task, use_web=use_web)
 
-    def sync_github(self, message=""):
-        try:
-            results = self._git().auto_sync(message)
-            out = []
-            for step, res in results.items():
-                icon = "OK" if res.get("ok") else "FAIL"
-                out.append(icon + " " + step + ": " + res.get("msg", res.get("error", "")))
-            return "\n".join(out)
-        except Exception as e:
-            return "FAIL GitHub sync: " + str(e)
+    def status(self) -> str:
+        gw   = self._gateway()
+        free = gw.router.available_free()
+        return (f"AIConductor: {self._n_tasks} task eseguiti\n"
+                f"Modelli free disponibili: {len(free)}\n"
+                + "\n".join("  ✅ "+m for m in free[:8]))
 
-    def status(self):
-        lines = ["=== AIConductor Status ===", "Task eseguiti: " + str(self._task_count)]
-        try:
-            lines.append(self._gw().status_report())
-        except Exception as e:
-            lines.append("Gateway: " + str(e))
-        return "\n".join(lines)
+    def _gateway(self):
+        if not self._gw:
+            from .ai_gateway import AIGateway
+            self._gw = AIGateway(self.config)
+        return self._gw
 
-    def _trigger_self_improvement(self):
-        def run():
-            try:
-                from .agents.self_improvement_loop import SelfImprovementLoop
-                SelfImprovementLoop(self.config).run_cycle()
-                self._git().commit("self-improvement: ciclo " + str(self._task_count // 10))
-            except Exception as e:
-                log.warning("Self-improvement: %s", e)
-        threading.Thread(target=run, daemon=True).start()
-
-    def _load_task_count(self):
-        f = self._memory / "conductor_state.json"
-        if f.exists():
-            try:
-                return json.loads(f.read_text(encoding="utf-8")).get("task_count", 0)
-            except Exception:
-                pass
-        return 0
-
-    def _save_task_count(self):
-        f = self._memory / "conductor_state.json"
-        try:
-            f.write_text(json.dumps({"task_count": self._task_count}, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
+    def _researcher(self):
+        if not self._research:
+            from .human_researcher import HumanResearcher
+            self._research = HumanResearcher(self.config)
+        return self._research
 
 
 class AIConductorTool:
-    """Tool wrapper per ToolRegistry."""
-
+    """Wrapper per ToolRegistry."""
     def __init__(self, config):
         self.config = config
-        self._conductor = None
+        self._c     = None
 
-    def _get(self):
-        if not self._conductor:
-            self._conductor = AIConductor(self.config)
-        return self._conductor
+    def _get(self) -> AIConductor:
+        if not self._c:
+            self._c = AIConductor(self.config)
+        return self._c
 
-    def ai_ask(self, prompt, model="auto", mode="auto"):
-        result = self._get().ask(prompt, model=model, mode=mode)
-        if result["ok"]:
-            m = result.get("model", "?").split("/")[-1]
-            return "[" + m + "] " + result["text"]
-        return "FAIL " + result.get("error", "errore")
+    def ai_ask(self, prompt: str, model: str = "auto", mode: str = "auto") -> str:
+        r = self._get().ask(prompt, model=model, mode=mode)
+        if r.get("ok"):
+            m = r.get("model_id","?").split("/")[-1]
+            return f"[{m}] {r['text']}"
+        return "❌ " + r.get("error", "errore")
 
-    def ai_parallel(self, prompt, models=""):
-        ALIASES = {
-            "gemini": "gemini/gemini-2.5-flash",
-            "gemini3": "gemini/gemini-2.5-pro",
-            "claude": "openrouter/anthropic/claude-sonnet-4-6",
-            "gpt": "openrouter/openai/gpt-5.2",
-            "grok": "openrouter/x-ai/grok-4",
-            "deepseek": "openrouter/deepseek/deepseek-v3",
-            "ollama": "ollama/qwen3:8b",
-        }
-        model_ids = [ALIASES.get(m.strip(), m.strip()) for m in models.split(",") if m.strip()] if models.strip() else None
-        result = self._get().ask_parallel(prompt, models=model_ids)
-        if result["ok"]:
-            n = result.get("parallel_count", 1)
-            return "[PARALLELO " + str(n) + " modelli] " + result["text"]
-        return "FAIL " + result.get("error", "errore")
+    def ai_parallel(self, prompt: str, models: str = "") -> str:
+        from .ai_router import MODELS as ALL_MODELS
+        ALIASES = {"gemini":"gemini-flash","claude":"claude-sonnet","gpt":"gpt-5",
+                   "ollama":"ollama-qwen","deepseek":"deepseek"}
+        mlist = [ALIASES.get(m.strip(), m.strip())
+                 for m in models.split(",") if m.strip()] if models.strip() else None
+        r = self._get().ask_parallel(prompt, mlist)
+        if r.get("ok"):
+            return f"[PARALLELO {r.get('n_ok',1)}/{r.get('n_total',1)}] {r['text']}"
+        return "❌ " + r.get("error","tutti falliti")
 
-    def ai_status(self):
+    def ai_research(self, task: str, web: str = "true") -> str:
+        """Ricerca come una persona: web + multi-AI + sintesi."""
+        use_web = web.lower() not in ("false","0","no")
+        r = self._get().research(task, use_web=use_web)
+        if r.get("ok"):
+            return f"[Research {r['elapsed']}s] {r['synthesis']}"
+        return "❌ Ricerca fallita"
+
+    def ai_status(self) -> str:
         return self._get().status()
 
-    def ai_models(self, filter_available="all"):
+    def ai_models(self, filter_available: str = "all") -> str:
         try:
-            from .ai_router import MODELS_2026
+            from .ai_router import MODELS
         except ImportError:
-            from ai_router import MODELS_2026
-        gw = self._get()._gw()
-        router = gw.router
-        lines = ["Modelli AI (Mar 2026):"]
-        for tier in [1, 2, 3]:
-            lines.append("\n-- Tier " + str(tier) + " --")
-            for mid, meta in MODELS_2026.items():
-                if meta["tier"] != tier:
-                    continue
-                avail = router._is_available(mid)
-                if filter_available == "available" and not avail:
-                    continue
-                if filter_available == "free" and not meta.get("free_tier"):
-                    continue
-                icon = "OK" if avail else "X "
-                free_tag = " [FREE]" if meta.get("free_tier") else ""
-                lines.append(icon + " " + meta["display"] + free_tag +
-                              " | IQ " + str(meta.get("intelligence", "?")) +
-                              " | $" + str(meta["cost_in"]) + "/1M" +
-                              " | " + ", ".join(meta.get("strengths", [])[:3]))
+            from ai_router import MODELS
+        gw    = self._get()._gateway()
+        lines = ["Modelli DUST AI (Mar 2026):","─"*50]
+        for name, m in MODELS.items():
+            avail = gw.router._available(name)
+            if filter_available == "available" and not avail:
+                continue
+            if filter_available == "free" and not m.get("free"):
+                continue
+            icon  = "✅" if avail else "❌"
+            free  = " [FREE]" if m.get("free") else " [PAID]"
+            lines.append(f"  {icon} {name:<18}{free} IQ:{m.get('iq','?'):>3} | {', '.join(m.get('str',[])[:3])}")
         return "\n".join(lines)
-
-    def git_sync(self, message=""):
-        return self._get().sync_github(message)

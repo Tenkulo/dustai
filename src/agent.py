@@ -217,6 +217,8 @@ class Agent:
         self._hall_guard = None
         self._setup_gemini()
         self._setup_ollama()
+        self._browser_ai  = None  # BrowserAIBridge lazy
+        self._conductor   = None  # AIConductor lazy
 
     # ─── Setup ───────────────────────────────────────────────────────────────
 
@@ -480,6 +482,30 @@ class Agent:
                 self._hall_guard = False
         return self._hall_guard if self._hall_guard else None
 
+
+    def _get_browser_ai(self):
+        """Lazy init BrowserAIBridge – fallback illimitato."""
+        if self._browser_ai is None:
+            try:
+                from .tools.browser_ai_bridge import BrowserAIBridge
+                self._browser_ai = BrowserAIBridge(self.config)
+                self.log.info("BrowserAIBridge OK")
+            except Exception as e:
+                self.log.warning("BrowserAI N/D: %s", str(e)[:60])
+                self._browser_ai = False
+        return self._browser_ai if self._browser_ai else None
+
+    def _get_conductor(self):
+        """Lazy init AIConductor."""
+        if self._conductor is None:
+            try:
+                from .ai_conductor import AIConductor
+                self._conductor = AIConductor(self.config)
+            except Exception as e:
+                self.log.warning("AIConductor N/D: %s", str(e)[:60])
+                self._conductor = False
+        return self._conductor if self._conductor else None
+
     def _call_model(self, messages: list, task_hint: str = "") -> dict:
         """
         Chiama il modello migliore disponibile.
@@ -496,8 +522,39 @@ class Agent:
                 return self._call_gemini_fn(messages)
             except RuntimeError as e:
                 if "SWITCH_TO_OLLAMA" in str(e):
-                    self.log.warning("Gemini 429 → switch Ollama")
-                    print("   🔄 Gemini esaurito → Ollama locale")
+                    self.log.warning("429 → cascade KEY2/KEY3/Browser/Ollama")
+                    import os
+                    # STEP 1: Gemini KEY_2 e KEY_3
+                    for _env in ("GOOGLE_API_KEY_2","GOOGLE_API_KEY_3"):
+                        _k = os.environ.get(_env,"")
+                        if not _k: continue
+                        try:
+                            import google.generativeai as _g
+                            _g.configure(api_key=_k)
+                            _m = _g.GenerativeModel("gemini-2.5-flash")
+                            _task = (messages[-1].get("parts",[""])[0]
+                                     if messages else "")
+                            _resp = _m.generate_content(str(_task)[:3000])
+                            try:
+                                _txt = _resp.text.strip()
+                            except Exception:
+                                _txt = ""
+                            if _txt:
+                                print("   🔑 "+_env+" → OK")
+                                return {"type":"text","text":_txt}
+                        except Exception:
+                            pass
+                    # STEP 2: BrowserAI (Gemini/ChatGPT web – zero rate limit)
+                    _bridge = self._get_browser_ai()
+                    if _bridge and _bridge.get_ready_providers():
+                        _task_txt = (messages[-1].get("parts",[""])[0]
+                                     if messages else "")
+                        _br = _bridge.query(str(_task_txt)[:3000])
+                        if _br.get("ok"):
+                            print("   🌐 BrowserAI ["+_br["provider"]+"] → OK")
+                            return {"type":"text","text":_br["text"]}
+                    # STEP 3: Ollama locale (sempre disponibile)
+                    print("   🔄 Cascade esaurito → Ollama locale")
                 else:
                     raise
 

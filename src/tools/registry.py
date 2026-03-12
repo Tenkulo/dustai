@@ -15,6 +15,31 @@ from .web_search import WebSearchTool
 from .code_runner import CodeRunnerTool
 
 
+# ─── DUST Orchestra imports (auto-generated) ─────────────────────────────
+try:
+    from ..ai_conductor import AIConductorTool as _AIConductorTool
+    _CONDUCTOR_OK = True
+except Exception:
+    _CONDUCTOR_OK = False; _AIConductorTool = None
+
+try:
+    from ..human_researcher import HumanResearcherTool as _HRTool
+    _HR_OK = True
+except Exception:
+    _HR_OK = False; _HRTool = None
+
+try:
+    from .browser_ai_bridge import BrowserAITool as _BrAI
+    _BROWSER_OK = True
+except Exception:
+    _BROWSER_OK = False; _BrAI = None
+
+try:
+    from ..github_sync import GitSyncTool as _GitSync
+    _GIT_OK = True
+except Exception:
+    _GIT_OK = False; _GitSync = None
+
 class ToolRegistry:
     def __init__(self, config):
         self.config = config
