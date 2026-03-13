@@ -1,195 +1,109 @@
-"""DUST AI – BrowserAIBridge v2.0
-Interroga AI via browser Playwright – zero rate limit.
-"""
-import json, time, logging, hashlib
-from pathlib import Path
-log = logging.getLogger("BrowserAI")
+"""Browser AI Bridge: Gemini web / ChatGPT web via Playwright (last-resort AI fallback)."""
+import json
+import logging
+import time
 
-PROFILES = Path(r"A:\dustai_stuff\browser_profiles")
-CACHE    = Path(r"A:\dustai_stuff\cache\browser_ai")
-TTL      = 3600   # 1 ora cache
-
-PROVIDERS = {
-    "gemini":     {"url":"https://gemini.google.com/app",  "pri":1,
-                   "inp":"rich-textarea div[contenteditable]",
-                   "send":"button[aria-label*='Send']",
-                   "out":"message-content p","done":"button[aria-label*='Send']:not([disabled])"},
-    "chatgpt":    {"url":"https://chatgpt.com/",           "pri":2,
-                   "inp":"#prompt-textarea",
-                   "send":"button[data-testid='send-button']",
-                   "out":"[data-message-author-role='assistant'] p",
-                   "done":"button[data-testid='send-button']:not([disabled])"},
-    "claude":     {"url":"https://claude.ai/new",          "pri":3,
-                   "inp":"div[contenteditable='true']",
-                   "send":"button[aria-label='Send Message']",
-                   "out":".prose p","done":"button[aria-label='Send Message']:not([disabled])"},
-    "grok":       {"url":"https://grok.com/",              "pri":4,
-                   "inp":"textarea","send":"button[type='submit']",
-                   "out":".message-content p","done":"button[type='submit']:not([disabled])"},
-    "perplexity": {"url":"https://www.perplexity.ai/",     "pri":5,
-                   "inp":"textarea[placeholder]","send":"button[aria-label*='Submit']",
-                   "out":".prose p","done":"button[aria-label*='Submit']:not([disabled])"},
-}
-ORDER = sorted(PROVIDERS, key=lambda p: PROVIDERS[p]["pri"])
+logger = logging.getLogger("dust.browser_ai_bridge")
 
 
 class BrowserAIBridge:
-    def __init__(self, config=None):
-        self.config = config
-        PROFILES.mkdir(parents=True, exist_ok=True)
-        CACHE.mkdir(parents=True, exist_ok=True)
-        self._st = self._load_status()
+    """Use web-based AI UIs when all API quotas are exhausted."""
 
-    def query(self, prompt: str, provider="auto", use_cache=True) -> dict:
-        if use_cache:
-            c = self._cache_get(prompt, provider)
-            if c:
-                return {"ok": True, "text": c, "provider": provider+"_cached"}
-        provs = ORDER if provider == "auto" else [provider]
-        for p in provs:
-            if self._st.get(p) == "error":
-                continue
+    SERVICES = ["gemini_web", "chatgpt_web"]
+
+    def __init__(self):
+        self._pw      = None
+        self._browser = None
+        self._ctx     = None
+
+    # ── Browser lifecycle ────────────────────────────────────
+    def _ensure(self):
+        if self._browser is not None:
+            return
+        from playwright.sync_api import sync_playwright
+        self._pw      = sync_playwright().__enter__()
+        self._browser = self._pw.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled",
+                  "--start-maximized"],
+        )
+        self._ctx = self._browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
+        )
+
+    def close(self):
+        try:
+            if self._browser:
+                self._browser.close()
+            if self._pw:
+                self._pw.__exit__(None, None, None)
+        except Exception:
+            pass
+
+    # ── Public API ───────────────────────────────────────────
+    def chat(self, messages: list[dict], timeout: int = 45) -> str:
+        self._ensure()
+        prompt = self._format(messages)
+        for svc in self.SERVICES:
             try:
-                r = self._query_one(p, prompt)
-                if r.get("ok"):
-                    if use_cache:
-                        self._cache_set(prompt, p, r["text"])
-                    return r
-            except Exception as e:
-                log.warning("BrowserAI %s: %s", p, str(e)[:80])
-                self._st[p] = "error"
-                self._save_status()
-        return {"ok": False, "error": "Tutti i browser provider falliti"}
+                if svc == "gemini_web":
+                    return self._gemini(prompt, timeout)
+                elif svc == "chatgpt_web":
+                    return self._chatgpt(prompt, timeout)
+            except Exception as exc:
+                logger.warning(f"BrowserAI {svc}: {exc}")
+        raise RuntimeError("Tutti i servizi BrowserAI non disponibili.")
 
-    def get_ready_providers(self) -> list:
-        return [p for p in ORDER
-                if (PROFILES/p).exists() and self._st.get(p) != "error"]
+    @staticmethod
+    def _format(messages: list[dict]) -> str:
+        return "\n".join(
+            m.get("content", "") for m in messages if m.get("role") == "user"
+        )
 
-    def login(self, provider="gemini") -> str:
+    # ── Gemini web ───────────────────────────────────────────
+    def _gemini(self, prompt: str, timeout: int) -> str:
+        page = self._ctx.new_page()
         try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            return "playwright non installato: pip install playwright && python -m playwright install chromium"
+            page.goto("https://gemini.google.com/app", wait_until="networkidle", timeout=20_000)
+            time.sleep(2)
+            sel = "rich-textarea, textarea, [contenteditable='true']"
+            page.wait_for_selector(sel, timeout=8_000)
+            el = page.query_selector(sel)
+            if not el:
+                raise RuntimeError("Input non trovato")
+            el.click()
+            el.type(prompt, delay=18)
+            page.keyboard.press("Enter")
+            time.sleep(min(timeout, 30))
+            els = page.query_selector_all("message-content, .response-content, model-response")
+            if els:
+                text = els[-1].text_content().strip()
+                return json.dumps({"type": "done", "message": text})
+            raise RuntimeError("Risposta non trovata")
+        finally:
+            page.close()
+
+    # ── ChatGPT web ──────────────────────────────────────────
+    def _chatgpt(self, prompt: str, timeout: int) -> str:
+        page = self._ctx.new_page()
         try:
-            with sync_playwright() as pw:
-                ctx = pw.chromium.launch_persistent_context(
-                    user_data_dir=str(PROFILES/provider),
-                    headless=False, viewport={"width":1280,"height":800})
-                page = ctx.new_page()
-                page.goto(PROVIDERS[provider]["url"], timeout=30000)
-                print(f"\n{'='*50}\nLOGIN MANUALE: {provider}")
-                print("Fai login nel browser aperto, poi premi INVIO qui.")
-                input(">>> INVIO dopo login: ")
-                self._st[provider] = "ready"
-                self._save_status()
-                ctx.close()
-            return f"✅ Login {provider} salvato."
-        except Exception as e:
-            return f"❌ Errore: {str(e)[:100]}"
-
-    def status(self) -> str:
-        lines = ["=== BrowserAI Status ==="]
-        for p in ORDER:
-            ok = (PROFILES/p).exists() and self._st.get(p) != "error"
-            lines.append(("✅" if ok else "❌")+" "+p.ljust(12)+" ["+self._st.get(p,"non configurato")+"]")
-        lines.append("\nPer fare login: browser_ai_login provider=gemini")
-        return "\n".join(lines)
-
-    def _query_one(self, provider: str, prompt: str, timeout_ms=60000) -> dict:
-        cfg = PROVIDERS[provider]
-        try:
-            from playwright.sync_api import sync_playwright, TimeoutError as PwTO
-            with sync_playwright() as pw:
-                ctx = pw.chromium.launch_persistent_context(
-                    user_data_dir=str(PROFILES/provider), headless=True,
-                    args=["--no-sandbox","--disable-blink-features=AutomationControlled"])
-                page = ctx.new_page()
-                page.goto(cfg["url"], timeout=30000, wait_until="domcontentloaded")
-                try:
-                    page.wait_for_selector(cfg["inp"], timeout=12000)
-                except PwTO:
-                    ctx.close()
-                    self._st[provider] = "logged_out"
-                    return {"ok":False,"error":provider+": login scaduto – esegui browser_ai_login provider="+provider}
-                el = page.locator(cfg["inp"]).last
-                el.click()
-                el.fill("")
-                for i in range(0, len(prompt), 500):
-                    el.type(prompt[i:i+500], delay=8)
-                    time.sleep(0.05)
-                page.locator(cfg["send"]).click(timeout=5000)
-                try:
-                    page.wait_for_selector(cfg["done"], timeout=timeout_ms)
-                except PwTO:
-                    pass
-                time.sleep(1.5)
-                texts = []
-                for el in page.locator(cfg["out"]).all()[-20:]:
-                    try:
-                        t = el.inner_text().strip()
-                        if t and len(t) > 5:
-                            texts.append(t)
-                    except Exception:
-                        pass
-                ctx.close()
-                if not texts:
-                    return {"ok":False,"error":provider+": nessun testo estratto"}
-                self._st[provider] = "ready"
-                self._save_status()
-                return {"ok":True,"text":"\n\n".join(texts),"provider":provider+"_web"}
-        except ImportError:
-            return {"ok":False,"error":"playwright non installato"}
-        except Exception as e:
-            return {"ok":False,"error":str(e)[:200]}
-
-    def _cache_key(self, p, prov):
-        return hashlib.md5((prov+p[:500]).encode()).hexdigest()
-
-    def _cache_get(self, prompt, provider):
-        f = CACHE/(self._cache_key(prompt,provider)+".json")
-        if not f.exists(): return None
-        try:
-            d = json.loads(f.read_text(encoding="utf-8"))
-            if time.time()-d.get("ts",0) < TTL:
-                return d.get("text")
-        except Exception: pass
-        return None
-
-    def _cache_set(self, prompt, provider, text):
-        try:
-            (CACHE/(self._cache_key(prompt,provider)+".json")).write_text(
-                json.dumps({"ts":time.time(),"text":text},ensure_ascii=False),
-                encoding="utf-8")
-        except Exception: pass
-
-    def _load_status(self):
-        f = PROFILES/"status.json"
-        if f.exists():
-            try: return json.loads(f.read_text(encoding="utf-8"))
-            except: pass
-        return {}
-
-    def _save_status(self):
-        try: (PROFILES/"status.json").write_text(json.dumps(self._st,indent=2),encoding="utf-8")
-        except: pass
-
-
-class BrowserAITool:
-    def __init__(self, config):
-        self.config = config
-        self._b     = None
-
-    def _get(self):
-        if not self._b:
-            self._b = BrowserAIBridge(self.config)
-        return self._b
-
-    def browser_ai_query(self, prompt: str, provider: str = "auto") -> str:
-        r = self._get().query(prompt, provider)
-        return ("["+r["provider"]+"] "+r["text"]) if r.get("ok") else "❌ "+r.get("error","")
-
-    def browser_ai_login(self, provider: str = "gemini") -> str:
-        return self._get().login(provider)
-
-    def browser_ai_status(self) -> str:
-        return self._get().status()
+            page.goto("https://chat.openai.com", wait_until="networkidle", timeout=20_000)
+            time.sleep(2)
+            ta = page.wait_for_selector("textarea#prompt-textarea", timeout=8_000)
+            if not ta:
+                raise RuntimeError("Textarea non trovata")
+            ta.click(); ta.type(prompt, delay=18)
+            page.keyboard.press("Enter")
+            time.sleep(min(timeout, 35))
+            msgs = page.query_selector_all("[data-message-author-role='assistant']")
+            if msgs:
+                text = msgs[-1].text_content().strip()
+                return json.dumps({"type": "done", "message": text})
+            raise RuntimeError("Risposta non trovata")
+        finally:
+            page.close()

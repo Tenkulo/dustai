@@ -1,170 +1,107 @@
-"""
-DUST AI – Memory v2.0
-Short-term (messaggi sessione) + Long-term (JSON disco) + SkillForge + TaskQueue.
-"""
-import json, logging, time
-from datetime import datetime
+import json
+import time
 from pathlib import Path
 
-log = logging.getLogger("Memory")
+try:
+    from config import BASE_PATH
+except ImportError:
+    import pathlib; BASE_PATH = pathlib.Path(r"A:\dustai")
+
+MEMORY_FILE  = BASE_PATH / "dustai_stuff" / "memory.json"
+SKILLS_FILE  = BASE_PATH / "dustai_stuff" / "skills.json"
+
 
 class Memory:
-    MAX_SHORT = 30
+    """Persistent key-value memory store."""
 
-    def __init__(self, config):
-        self.config = config
-        self._short = []
-        self._long  = []
-        self._facts = []
+    def __init__(self):
+        self._data: dict = {}
         self._load()
 
     def _load(self):
-        f = self.config.get_memory_file()
-        if f.exists():
+        if MEMORY_FILE.exists():
             try:
-                d = json.loads(f.read_text(encoding="utf-8"))
-                self._long  = d.get("summaries", [])
-                self._facts = d.get("facts", [])
-                log.info("Memoria: %d sommari, %d fatti", len(self._long), len(self._facts))
-            except Exception as e:
-                log.warning("Memoria non caricata: %s", e)
+                self._data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                self._data = {}
 
-    def _save(self):
-        try:
-            self.config.get_memory_file().write_text(
-                json.dumps({
-                    "updated": datetime.now().isoformat(),
-                    "summaries": self._long[-100:],
-                    "facts":     self._facts[-200:],
-                }, indent=2, ensure_ascii=False),
-                encoding="utf-8"
-            )
-        except Exception as e:
-            log.warning("Memoria non salvata: %s", e)
+    def _flush(self):
+        MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MEMORY_FILE.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    def add_interaction(self, role: str, content: str):
-        self._short.append({"role": role, "content": content[:500],
-                             "ts": datetime.now().isoformat()})
-        if len(self._short) > self.MAX_SHORT:
-            self._short = self._short[-self.MAX_SHORT:]
-        if role == "user":
-            self._long.append(f"[{datetime.now().strftime('%m-%d %H:%M')}] {content[:100]}")
-            self._save()
+    def save(self, key: str, value) -> None:
+        self._data[key] = {"value": value, "ts": time.time()}
+        self._flush()
 
-    # alias per retrocompatibilità
-    def add(self, task, response):
-        self.add_interaction("user", task)
-        self.add_interaction("assistant", response)
+    def get(self, key: str, default=None):
+        item = self._data.get(key)
+        return item["value"] if item else default
 
-    def add_fact(self, fact: str):
-        self._facts.append(fact[:200])
-        self._save()
+    def delete(self, key: str) -> None:
+        self._data.pop(key, None)
+        self._flush()
 
-    def get_context(self) -> str:
-        parts = []
-        if self._facts:
-            parts.append("Fatti noti: " + "; ".join(self._facts[-5:]))
-        if self._long:
-            parts.append("Storico recente: " + " | ".join(self._long[-5:]))
-        return "\n".join(parts) if parts else ""
+    def all(self) -> dict:
+        return {k: v["value"] for k, v in self._data.items()}
 
-    def get_messages(self) -> list:
-        return list(self._short)
+    def recent(self, n: int = 10) -> list[tuple]:
+        items = sorted(self._data.items(), key=lambda x: x[1].get("ts", 0), reverse=True)
+        return [(k, v["value"]) for k, v in items[:n]]
 
 
 class SkillForge:
-    def __init__(self, config):
-        self.config = config
-        self._skills = {}
+    """Learned skills/code snippets store."""
+
+    def __init__(self):
+        self._skills: dict = {}
         self._load()
 
     def _load(self):
-        f = self.config.get_skills_file()
-        if f.exists():
+        if SKILLS_FILE.exists():
             try:
-                self._skills = json.loads(f.read_text(encoding="utf-8"))
+                self._skills = json.loads(SKILLS_FILE.read_text(encoding="utf-8"))
             except Exception:
-                pass
+                self._skills = {}
 
-    def _save(self):
-        try:
-            self.config.get_skills_file().write_text(
-                json.dumps(self._skills, indent=2, ensure_ascii=False),
-                encoding="utf-8"
-            )
-        except Exception:
-            pass
+    def _flush(self):
+        SKILLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SKILLS_FILE.write_text(json.dumps(self._skills, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    def learn(self, task_type: str, pattern: str, result: str):
-        if task_type not in self._skills:
-            self._skills[task_type] = []
-        self._skills[task_type].append({
-            "pattern": pattern[:100],
-            "result":  result[:100],
-            "ts":      datetime.now().isoformat(),
-        })
-        self._skills[task_type] = self._skills[task_type][-20:]
-        self._save()
+    def learn(self, name: str, code: str, description: str = "") -> None:
+        self._skills[name] = {"code": code, "desc": description, "uses": 0}
+        self._flush()
 
-    def recall(self, task_type: str) -> list:
-        return self._skills.get(task_type, [])
+    def get(self, name: str) -> dict | None:
+        skill = self._skills.get(name)
+        if skill:
+            skill["uses"] += 1
+            self._flush()
+        return skill
+
+    def list_skills(self) -> list[str]:
+        return list(self._skills.keys())
 
 
 class TaskQueue:
-    def __init__(self, config):
-        self.config = config
-        self._f = config.get_tasks_file()
+    """Simple in-memory task queue."""
 
-    def _load(self):
-        if self._f.exists():
-            try:
-                return json.loads(self._f.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return []
+    def __init__(self):
+        self._q: list = []
 
-    def _save(self, tasks):
-        self._f.write_text(
-            json.dumps(tasks, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+    def push(self, task) -> None:
+        self._q.append(task)
 
-    def add(self, task_id: str, task_text: str, priority: int = 5):
-        tasks = self._load()
-        if not any(t["id"] == task_id for t in tasks):
-            tasks.append({
-                "id": task_id, "task": task_text,
-                "status": "pending", "priority": priority,
-                "created_at": datetime.now().isoformat(),
-            })
-            self._save(tasks)
+    def pop(self):
+        return self._q.pop(0) if self._q else None
 
-    def next(self):
-        tasks = self._load()
-        pending = [t for t in tasks if t.get("status") == "pending"]
-        pending.sort(key=lambda t: t.get("priority", 5))
-        if pending:
-            t = pending[0]
-            for task in tasks:
-                if task["id"] == t["id"]:
-                    task["status"] = "running"
-                    task["started_at"] = datetime.now().isoformat()
-            self._save(tasks)
-            return t
-        return None
+    def peek(self):
+        return self._q[0] if self._q else None
 
-    def complete(self, task_id: str, result: str, success: bool = True):
-        tasks = self._load()
-        for t in tasks:
-            if t["id"] == task_id:
-                t["status"] = "done" if success else "failed"
-                t["result"] = result[:300]
-                t["completed_at"] = datetime.now().isoformat()
-        self._save(tasks)
+    def is_empty(self) -> bool:
+        return len(self._q) == 0
 
-    def reset_stuck(self):
-        tasks = self._load()
-        for t in tasks:
-            if t.get("status") in ("running",):
-                t["status"] = "pending"
-                t.pop("started_at", None)
-        self._save(tasks)
+    def all(self) -> list:
+        return list(self._q)
+
+    def clear(self) -> None:
+        self._q.clear()

@@ -1,77 +1,50 @@
-"""
-DUST AI – Config v3.0
-BASE_PATH unificato, multi-key Gemini, carica .env automaticamente.
-"""
-import os, json, platform
-from pathlib import Path
+import os
+import pathlib
 
-# ─── Carica .env automaticamente ─────────────────────────────────────────────
-def _load_dotenv():
-    candidates = [
-        Path(r"A:\dustai_stuff\.env"),
-        Path(__file__).parent.parent / ".env",
-        Path.home() / ".env",
-    ]
-    for f in candidates:
-        if f.exists():
-            for line in f.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, _, v = line.partition("=")
-                    os.environ.setdefault(k.strip(), v.strip())
-            break
+BASE_PATH  = pathlib.Path(r"A:\dustai")
+STUFF_PATH = pathlib.Path(r"A:\dustai_stuff")
 
-_load_dotenv()
+# Load .env from dustai_stuff
+_env_file = STUFF_PATH / ".env"
+if _env_file.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file, override=True)
+    except ImportError:
+        # Manual parse fallback
+        for line in _env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
 
-BASE_PATH = Path(os.environ.get("DUSTAI_BASE", r"A:\dustai_stuff"))
 
 class Config:
-    def __init__(self):
-        BASE_PATH.mkdir(parents=True, exist_ok=True)
-        for d in ("logs", "memory", "skills", "tasks", "screenshots",
-                  "patches", "backups", "browser_profiles", "cache"):
-            (BASE_PATH / d).mkdir(exist_ok=True)
+    _cfg: dict = {}
 
-        self._cfg = {
-            "model_primary":  "gemini-2.5-flash",
-            "model_heavy":    "gemini-2.5-pro",
-            "model_local":    "qwen3:8b",
-            "max_steps":      25,
-            "language":       "it",
-            "base_path":      str(BASE_PATH),
-        }
-        cfg_file = BASE_PATH / "config.json"
-        if cfg_file.exists():
-            try:
-                self._cfg.update(json.loads(cfg_file.read_text(encoding="utf-8")))
-            except Exception:
-                pass
+    @classmethod
+    def get(cls, key, default=None):
+        return os.environ.get(key, cls._cfg.get(key, default))
 
-    def get_model(self, kind="primary"):
-        return self._cfg.get(f"model_{kind}", self._cfg.get("model_primary", "gemini-2.5-flash"))
+    @classmethod
+    def set(cls, key, value):
+        cls._cfg[key] = value
 
-    def get_api_key(self, provider="google", index=1):
-        env = "GOOGLE_API_KEY" if provider == "google" else provider.upper() + "_API_KEY"
-        if index > 1:
-            env = env + f"_{index}"
-        return os.environ.get(env, "")
 
-    def get_all_google_keys(self):
-        keys = []
-        for env in ("GOOGLE_API_KEY", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3"):
-            k = os.environ.get(env, "")
-            if k:
-                keys.append((env, k))
-        return keys
+# ── Gemini keys (cascade KEY1 → KEY2 → KEY3) ────────────────
+GEMINI_KEYS: list[str] = [
+    k for k in [
+        os.environ.get("GOOGLE_API_KEY"),
+        os.environ.get("GOOGLE_API_KEY_2"),
+        os.environ.get("GOOGLE_API_KEY_3"),
+    ] if k
+]
 
-    def get_workdir(self):      return BASE_PATH
-    def get_logs_dir(self):     return BASE_PATH / "logs"
-    def get_memory_file(self):  return BASE_PATH / "memory" / "memory.json"
-    def get_skills_file(self):  return BASE_PATH / "skills" / "skills.json"
-    def get_tasks_file(self):   return BASE_PATH / "tasks" / "queue.json"
-    def get_screenshots_dir(self): return BASE_PATH / "screenshots"
-    def get_patches_dir(self):  return BASE_PATH / "patches"
-    def get_backups_dir(self):  return BASE_PATH / "backups"
+GEMINI_MODEL      = "gemini-2.5-flash-preview-04-17"
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_USER       = os.environ.get("GITHUB_USER", "Tenkulo")
+GITHUB_REPO       = "dustai"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
-    def get(self, key, default=None):
-        return self._cfg.get(key, default)
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODELS   = ["qwen3:8b", "mistral-small3.1"]
