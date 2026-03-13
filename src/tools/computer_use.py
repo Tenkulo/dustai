@@ -1,4 +1,4 @@
-"""Computer-use tools: screen_read, screen_do, app_open, browser_go."""
+"""Computer-use tools — screen_read usa google.genai (nuovo SDK)."""
 import io
 import json
 import logging
@@ -10,7 +10,7 @@ logger = logging.getLogger("dust.computer_use")
 
 
 def screen_read(region: list = None) -> dict:
-    """Take a screenshot and describe it using Gemini Vision."""
+    """Cattura screenshot e descrivilo con Gemini Vision."""
     try:
         import pyautogui
         from PIL import Image
@@ -18,20 +18,23 @@ def screen_read(region: list = None) -> dict:
 
         buf = io.BytesIO()
         screenshot.save(buf, format="PNG")
-        buf.seek(0)
+        image_bytes = buf.getvalue()
 
         from config import GEMINI_KEYS, GEMINI_MODEL
-        import google.generativeai as genai
+        from google import genai
+        from google.genai import types
 
         for key in GEMINI_KEYS:
             try:
-                genai.configure(api_key=key)
-                model = genai.GenerativeModel(GEMINI_MODEL)
-                img   = Image.open(buf); buf.seek(0)
-                resp  = model.generate_content([
-                    "Descrivi dettagliatamente questo screenshot: finestre aperte, "
-                    "testo visibile, bottoni, icone, stato del sistema.", img
-                ])
+                client = genai.Client(api_key=key)
+                resp   = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                        "Descrivi dettagliatamente questo screenshot: finestre aperte, "
+                        "testo visibile, bottoni, icone, stato del sistema.",
+                    ],
+                )
                 try:
                     return {"status": "ok", "description": resp.text}
                 except Exception:
@@ -47,11 +50,10 @@ def screen_read(region: list = None) -> dict:
 def screen_do(action: str, x: int = None, y: int = None, text: str = None,
               key: str = None, button: str = "left", clicks: int = 1,
               duration: float = 0.3, target: str = None) -> dict:
-    """Execute a GUI action: click | type | key | scroll | move | drag | screenshot."""
+    """Esegui un'azione GUI: click|type|key|scroll|move|drag|screenshot."""
     try:
         import pyautogui
         pyautogui.FAILSAFE = True
-
         action = action.lower()
 
         if action == "click":
@@ -72,10 +74,6 @@ def screen_do(action: str, x: int = None, y: int = None, text: str = None,
         elif action in ("type", "write"):
             pyautogui.write(text or "", interval=0.04)
             return {"status": "ok", "action": "type"}
-
-        elif action == "typewrite":          # alias
-            pyautogui.typewrite(text or "", interval=0.04)
-            return {"status": "ok"}
 
         elif action in ("key", "hotkey", "press"):
             if key:
@@ -108,27 +106,19 @@ def screen_do(action: str, x: int = None, y: int = None, text: str = None,
 
 
 def app_open(app_name: str, args: list = None) -> dict:
-    """Open a Windows application by common name or exe path."""
+    """Apri un'applicazione Windows per nome o percorso .exe."""
     KNOWN = {
-        "notepad":    "notepad.exe",
-        "explorer":   "explorer.exe",
-        "calc":       "calc.exe",
-        "calculator": "calc.exe",
-        "chrome":     "chrome.exe",
-        "edge":       "msedge.exe",
-        "firefox":    "firefox.exe",
-        "cmd":        "cmd.exe",
-        "powershell": "powershell.exe",
-        "vscode":     "code.exe",
-        "code":       "code.exe",
-        "paint":      "mspaint.exe",
-        "word":       "winword.exe",
-        "excel":      "excel.exe",
+        "notepad": "notepad.exe", "explorer": "explorer.exe",
+        "calc": "calc.exe", "calculator": "calc.exe",
+        "chrome": "chrome.exe", "edge": "msedge.exe",
+        "firefox": "firefox.exe", "cmd": "cmd.exe",
+        "powershell": "powershell.exe", "vscode": "code.exe",
+        "code": "code.exe", "paint": "mspaint.exe",
+        "word": "winword.exe", "excel": "excel.exe",
     }
     try:
         exe = KNOWN.get(app_name.lower(), app_name)
-        cmd = [exe] + (args or [])
-        subprocess.Popen(cmd, shell=True)
+        subprocess.Popen([exe] + (args or []), shell=True)
         time.sleep(0.8)
         return {"status": "ok", "app": app_name}
     except Exception as exc:
@@ -136,7 +126,7 @@ def app_open(app_name: str, args: list = None) -> dict:
 
 
 def browser_go(url: str) -> dict:
-    """Open a URL in the default browser."""
+    """Apri un URL nel browser predefinito."""
     try:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
