@@ -1,213 +1,263 @@
-"""DUST Agent v4.1 — autoconsapevole, cascade 6 livelli, google.genai."""
+"""DUST Agent v4.2 — cascade 7 livelli: Gemini×3 → Groq → BrowserAI → Ollama×2."""
 import json
 import re
 import time
 import logging
+import threading
 from typing import Any
 
 logger = logging.getLogger("dust.agent")
 
 try:
-    from config import GEMINI_KEYS, GEMINI_MODEL, OLLAMA_BASE_URL, OLLAMA_MODELS
+    from config import (GEMINI_KEYS, GEMINI_MODEL, GROQ_API_KEY, GROQ_MODEL,
+                        OLLAMA_BASE_URL, OLLAMA_MODELS, OLLAMA_TIMEOUT)
 except ImportError:
-    GEMINI_KEYS = []
-    GEMINI_MODEL = "gemini-2.0-flash"
+    GEMINI_KEYS = []; GEMINI_MODEL = "gemini-2.0-flash"
+    GROQ_API_KEY = ""; GROQ_MODEL = "llama-3.3-70b-versatile"
     OLLAMA_BASE_URL = "http://localhost:11434"
-    OLLAMA_MODELS = ["qwen3:8b"]
+    OLLAMA_MODELS = ["qwen3:8b"]; OLLAMA_TIMEOUT = 300
 
-_SELF_CONTEXT = ""   # Caricato lazy alla prima richiesta
+# ── Lazy system prompt (caricato al primo uso) ────────────────────
+_PROMPT_LOCK = threading.Lock()
+_SYSTEM_PROMPT: str = ""
 
-def _get_self_context() -> str:
-    global _SELF_CONTEXT
-    if not _SELF_CONTEXT:
-        try:
-            from self_knowledge import get_system_context
-            _SELF_CONTEXT = get_system_context()
-        except Exception as exc:
-            _SELF_CONTEXT = f"(self-knowledge non disponibile: {exc})"
-    return _SELF_CONTEXT
+def _build_prompt() -> str:
+    base = """Sei DUST AI, un assistente personale universale intelligente su Windows.
+Rispondi in italiano in modo naturale e conversazionale.
+Hai piena autoconsapevolezza: conosci il tuo codice, i tuoi tool, la tua architettura.
 
-
-def _build_system_prompt() -> str:
-    ctx = _get_self_context()
-    return f"""Sei DUST AI, un assistente personale universale intelligente che gira su Windows.
-Rispondi in modo naturale e conversazionale in italiano.
-
-{ctx}
-
-REGOLE FONDAMENTALI:
-1. Puoi leggere il tuo codice sorgente con: {{"type":"tool_call","tool":"self_inspect","params":{{"path":"agent.py"}}}}
-2. Puoi modificare il tuo codice con self_edit_file — SEI AUTOCONSAPEVOLE e puoi auto-correggerti.
-3. Puoi eseguire azioni sul PC Windows (file, browser, mouse, tastiera, app).
-4. Conosci la tua architettura, i tuoi tool, la tua configurazione.
-
-FORMATO RISPOSTA — usa SOLO uno di questi due formati JSON:
-
-Per usare un tool:
-{{"type": "tool_call", "tool": "nome_tool", "params": {{"param1": "valore1"}}}}
-
-Per rispondere all'utente:
-{{"type": "done", "message": "la tua risposta conversazionale completa"}}
-
-Non scrivere MAI testo libero fuori dal JSON.
 """
+    try:
+        from self_knowledge import get_system_context
+        base += get_system_context() + "\n\n"
+    except Exception:
+        pass
+    base += """REGOLE RISPOSTA — usa SOLO uno di questi formati JSON:
 
-_SYSTEM_PROMPT_CACHE: str = ""
+Tool call:
+{"type": "tool_call", "tool": "nome_tool", "params": {"chiave": "valore"}}
+
+Risposta:
+{"type": "done", "message": "testo risposta completa in italiano"}
+
+Non scrivere MAI testo fuori dal JSON.
+"""
+    return base
 
 def get_system_prompt() -> str:
-    global _SYSTEM_PROMPT_CACHE
-    if not _SYSTEM_PROMPT_CACHE:
-        _SYSTEM_PROMPT_CACHE = _build_system_prompt()
-    return _SYSTEM_PROMPT_CACHE
+    global _SYSTEM_PROMPT
+    if not _SYSTEM_PROMPT:
+        with _PROMPT_LOCK:
+            if not _SYSTEM_PROMPT:
+                _SYSTEM_PROMPT = _build_prompt()
+    return _SYSTEM_PROMPT
 
-def invalidate_prompt_cache():
-    """Chiama dopo self_edit_file per forzare il rebuild del prompt."""
-    global _SYSTEM_PROMPT_CACHE, _SELF_CONTEXT
-    _SYSTEM_PROMPT_CACHE = ""
-    _SELF_CONTEXT = ""
+def invalidate_prompt():
+    global _SYSTEM_PROMPT
+    _SYSTEM_PROMPT = ""
 
 
+# ── Eccezioni ─────────────────────────────────────────────────────
 class RateLimitError(Exception):
-    def __init__(self, wait_seconds: int, api_key: str = ""):
-        self.wait_seconds = wait_seconds
-        self.api_key = api_key
-        super().__init__(f"Rate limit: {wait_seconds}s")
+    def __init__(self, wait: int, key: str = ""):
+        self.wait_seconds = wait; self.api_key = key
+        super().__init__(f"RateLimit {wait}s")
+
+class ProviderError(Exception):
+    pass
 
 
+# ── Gemini (google.genai nuovo SDK) ──────────────────────────────
 class GeminiClient:
-    """Usa google-genai (nuovo SDK)."""
-
     def __init__(self, api_key: str):
-        try:
-            from google import genai
-            self._client = genai.Client(api_key=api_key)
-        except ImportError:
-            raise RuntimeError("Installa: pip install google-genai")
+        from google import genai
+        self._c = genai.Client(api_key=api_key)
         self.api_key = api_key
 
-    def chat(self, messages: list[dict], system: str = None) -> str:
-        parts: list[str] = []
-        if system:
-            parts.append(f"[SYSTEM]\n{system}")
+    def chat(self, messages: list[dict], system: str) -> str:
+        parts = [f"[SYSTEM]\n{system}"]
         for m in messages:
             parts.append(f"[{m.get('role','user').upper()}]\n{m.get('content','')}")
-        prompt = "\n\n".join(parts)
-
         try:
-            resp = self._client.models.generate_content(
-                model=GEMINI_MODEL, contents=prompt)
+            r = self._c.models.generate_content(
+                model=GEMINI_MODEL, contents="\n\n".join(parts))
             try:
-                return resp.text
+                return r.text
             except Exception:
-                return json.dumps({"type": "done",
-                                   "message": "Risposta non disponibile."})
+                return json.dumps({"type":"done","message":"Risposta non disponibile."})
         except Exception as exc:
             err = str(exc)
-            if "429" in err or "quota" in err.lower() or "RATE_LIMIT" in err:
+            if "429" in err or "quota" in err.lower():
                 m = re.search(r"retry_delay[^0-9]*(\d+)", err)
-                wait = min(65, (int(m.group(1)) if m else 62) + 3)
-                raise RateLimitError(wait, self.api_key)
-            raise
+                raise RateLimitError(min(65, (int(m.group(1)) if m else 62)+3),
+                                     self.api_key)
+            raise ProviderError(str(exc))
 
 
+# ── Groq (OpenAI-compatible, 14.400 req/day gratis) ──────────────
+class GroqClient:
+    URL = "https://api.groq.com/openai/v1/chat/completions"
+
+    def __init__(self, api_key: str):
+        if not api_key:
+            raise ProviderError("GROQ_API_KEY non configurata")
+        self.api_key = api_key
+
+    def chat(self, messages: list[dict], system: str) -> str:
+        import requests
+        msgs = [{"role":"system","content":system}] + messages
+        try:
+            r = requests.post(
+                self.URL,
+                headers={"Authorization": f"Bearer {self.api_key}",
+                         "Content-Type": "application/json"},
+                json={"model": GROQ_MODEL, "messages": msgs, "max_tokens": 2048},
+                timeout=30,
+            )
+        except requests.exceptions.Timeout:
+            raise ProviderError("Groq timeout")
+        if r.status_code == 429:
+            raise RateLimitError(62, "groq")
+        if not r.ok:
+            raise ProviderError(f"Groq {r.status_code}: {r.text[:100]}")
+        return r.json()["choices"][0]["message"]["content"]
+
+
+# ── Ollama ────────────────────────────────────────────────────────
 class OllamaClient:
     def __init__(self, model: str):
         self.model = model
 
-    def chat(self, messages: list[dict], system: str = None) -> str:
+    def is_running(self) -> bool:
         import requests
-        msgs = ([{"role": "system", "content": system}] if system else []) + messages
-        r = requests.post(f"{OLLAMA_BASE_URL}/api/chat",
-                          json={"model": self.model, "messages": msgs, "stream": False},
-                          timeout=120)
-        r.raise_for_status()
+        try:
+            r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
+            return r.ok
+        except Exception:
+            return False
+
+    def chat(self, messages: list[dict], system: str) -> str:
+        import requests
+        msgs = [{"role":"system","content":system}] + messages
+        try:
+            r = requests.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json={"model": self.model, "messages": msgs, "stream": False},
+                timeout=OLLAMA_TIMEOUT,
+            )
+        except requests.exceptions.Timeout:
+            raise ProviderError(f"Ollama {self.model} timeout ({OLLAMA_TIMEOUT}s)")
+        except Exception as exc:
+            raise ProviderError(f"Ollama {self.model}: {exc}")
+        if not r.ok:
+            raise ProviderError(f"Ollama HTTP {r.status_code}")
         return r.json()["message"]["content"]
 
 
+# ── Agent ────────────────────────────────────────────────────────
 class Agent:
     def __init__(self, tools_registry=None, browser_bridge=None):
-        self.registry       = tools_registry
-        self.browser_bridge = browser_bridge
-        self._gemini:       list[GeminiClient] = []
-        self._cooldowns:    dict[str, float]   = {}
-        self._init_gemini()
+        self.registry        = tools_registry
+        self.browser_bridge  = browser_bridge
+        self._gemini:  list[GeminiClient] = []
+        self._groq:    GroqClient | None  = None
+        self._cooldowns: dict[str, float] = {}
+        self._init()
 
-    def _init_gemini(self):
-        for key in GEMINI_KEYS:
+    def _init(self):
+        for k in GEMINI_KEYS:
             try:
-                self._gemini.append(GeminiClient(key))
-                logger.info(f"Gemini ...{key[-6:]} OK")
+                self._gemini.append(GeminiClient(k))
+                logger.info(f"Gemini ...{k[-6:]} OK")
             except Exception as exc:
                 logger.warning(f"Gemini init: {exc}")
+        if GROQ_API_KEY:
+            try:
+                self._groq = GroqClient(GROQ_API_KEY)
+                logger.info("Groq OK")
+            except Exception as exc:
+                logger.warning(f"Groq init: {exc}")
 
-    def _next_gemini(self):
-        now = time.time()
-        for c in self._gemini:
-            if now >= self._cooldowns.get(c.api_key, 0):
-                return c
-        return None
+    def _available(self, key: str) -> bool:
+        return time.time() >= self._cooldowns.get(key, 0)
 
     def _cooldown(self, key: str, secs: int):
         self._cooldowns[key] = time.time() + secs
-        logger.warning(f"Key ...{key[-6:]} cooldown {secs}s")
+        logger.warning(f"{key} cooldown {secs}s")
 
-    def chat(self, messages: list[dict], **_) -> str:
-        sys_prompt = get_system_prompt()
+    def chat(self, messages: list[dict]) -> str:
+        sys = get_system_prompt()
 
-        # 1) Gemini cascade
-        c = self._next_gemini()
-        while c:
+        # ①②③ Gemini keys
+        for c in self._gemini:
+            if not self._available(c.api_key):
+                continue
             try:
-                return c.chat(messages, system=sys_prompt)
+                return c.chat(messages, sys)
             except RateLimitError as e:
                 self._cooldown(e.api_key, e.wait_seconds)
-                c = self._next_gemini()
-            except Exception as exc:
-                logger.error(f"Gemini: {exc}"); break
+            except ProviderError as e:
+                logger.error(f"Gemini: {e}")
+                break
+            except Exception as e:
+                logger.error(f"Gemini unexpected: {e}")
+                break
 
-        # 2) BrowserAI
+        # ④ Groq
+        if self._groq and self._available("groq"):
+            try:
+                return self._groq.chat(messages, sys)
+            except RateLimitError as e:
+                self._cooldown("groq", e.wait_seconds)
+            except ProviderError as e:
+                logger.warning(f"Groq: {e}")
+            except Exception as e:
+                logger.error(f"Groq unexpected: {e}")
+
+        # ⑤ BrowserAI
         if self.browser_bridge:
             try:
                 return self.browser_bridge.chat(messages)
-            except Exception as exc:
-                logger.warning(f"BrowserAI: {exc}")
+            except Exception as e:
+                logger.warning(f"BrowserAI: {e}")
 
-        # 3) Ollama
+        # ⑥⑦ Ollama
         for model in OLLAMA_MODELS:
+            c = OllamaClient(model)
+            if not c.is_running():
+                logger.warning("Ollama non attivo (localhost:11434)")
+                break
             try:
-                return OllamaClient(model).chat(messages, system=sys_prompt)
-            except Exception as exc:
-                logger.warning(f"Ollama {model}: {exc}")
+                return c.chat(messages, sys)
+            except ProviderError as e:
+                logger.warning(str(e))
 
-        return json.dumps({"type": "done",
-                           "message": "⚠️ Tutti i modelli AI non disponibili."})
+        return json.dumps({"type":"done",
+            "message":"⚠️ Tutti i modelli AI non disponibili. "
+                      "Controlla la connessione o avvia Ollama."})
 
-    def run_turn(self, user_msg: str, history: list = None, **kw) -> tuple:
+    def run_turn(self, user_msg: str, history: list = None) -> tuple:
         if history is None:
             history = []
-        messages     = history + [{"role": "user", "content": user_msg}]
+        msgs = history + [{"role":"user","content":user_msg}]
         tool_results = []
 
         for _ in range(10):
-            raw    = self.chat(messages)
-            parsed = self._parse(raw)
-
-            if parsed.get("type") == "tool_call":
-                tool   = parsed.get("tool", "")
-                params = parsed.get("params", {})
-                result = self._run_tool(tool, params)
-                tool_results.append({"tool": tool, "result": result})
-                messages.append({"role": "assistant", "content": raw})
-                messages.append({
-                    "role": "user",
-                    "content": f"[TOOL RESULT: {tool}]\n"
-                               f"{json.dumps(result, ensure_ascii=False)}"
-                })
+            raw = self.chat(msgs)
+            p   = self._parse(raw)
+            if p.get("type") == "tool_call":
+                tool   = p.get("tool","")
+                params = p.get("params",{})
+                res    = self._run_tool(tool, params)
+                tool_results.append({"tool":tool,"result":res})
+                msgs.append({"role":"assistant","content":raw})
+                msgs.append({"role":"user",
+                             "content":f"[TOOL RESULT: {tool}]\n"
+                                       f"{json.dumps(res, ensure_ascii=False)}"})
                 continue
+            return p.get("message", raw), tool_results
 
-            return parsed.get("message", raw), tool_results
-
-        return "Ho completato le operazioni.", tool_results
+        return "Operazioni completate.", tool_results
 
     def _parse(self, raw: str) -> dict:
         try:
@@ -216,7 +266,7 @@ class Agent:
                 return json.loads(m.group())
         except Exception:
             pass
-        return {"type": "done", "message": raw}
+        return {"type":"done","message":raw}
 
     def _run_tool(self, name: str, params: dict) -> Any:
         if self.registry:
@@ -224,4 +274,4 @@ class Agent:
                 return self.registry.call(name, **params)
             except Exception as exc:
                 return {"error": str(exc)}
-        return {"error": "registry not available"}
+        return {"error":"registry not available"}

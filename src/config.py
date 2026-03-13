@@ -1,8 +1,11 @@
 import os
 import pathlib
 
-BASE_PATH  = pathlib.Path(r"A:\dustai")
-STUFF_PATH = pathlib.Path(r"A:\dustai_stuff")
+BASE_PATH   = pathlib.Path(r"A:\dustai")
+STUFF_PATH  = pathlib.Path(r"A:\dustai_stuff")
+
+# Profilo browser persistente per BrowserAI (diverso da Chrome utente)
+BROWSER_PROFILE_DIR = STUFF_PATH / "browser_profile"
 
 _env_file = STUFF_PATH / ".env"
 if _env_file.exists():
@@ -37,8 +40,9 @@ GEMINI_KEYS: list[str] = [
     ] if k
 ]
 
-# ✅ Modello aggiornato — gemini-2.0-flash è disponibile gratis su v1beta
 GEMINI_MODEL       = "gemini-2.0-flash"
+GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL         = "llama-3.3-70b-versatile"   # 14.400 req/day free
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_USER        = os.environ.get("GITHUB_USER", "Tenkulo")
 GITHUB_REPO        = "dustai"
@@ -46,3 +50,4 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODELS   = ["qwen3:8b", "mistral-small3.1"]
+OLLAMA_TIMEOUT  = 300   # 5 minuti: prima load del modello può essere lenta
